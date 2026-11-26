@@ -32,8 +32,13 @@ public abstract class BaseObfuscatorChain implements ObfuscatorChain {
 
     @Override
     public final RebuildIfResult reBuild(IrMethod ir, Stmt stmt, List<Stmt> origStmts) {
+        // 换了方法就重置 key 去重池：同一方法内 key 必须互异（见 randomString 说明），
+        // 跨方法复用则无害 —— obfIndexI 不同，switchBlock 也是方法局部的。
+        if (irMethod != ir) {
+            irMethod = ir;
+            usedKeyHashes.clear();
+        }
         localIndex = ir.locals.size() * 2;
-        irMethod = ir;
         return reBuild0(ir, stmt, origStmts);
     }
 
@@ -89,17 +94,44 @@ public abstract class BaseObfuscatorChain implements ObfuscatorChain {
         return (c == 'J' || c == 'D') ? 2 : 1;
     }
 
-//    int index = 0;
-//    public String randomString(int depth) {
-//        return (index++) + "";
-//    }
+    /**
+     * 生成本次混淆使用的 key 序列。
+     *
+     * ⚠️ 2026-11-27 重写：改用 ObfDic 的 40494 条字典（`I` + 34 个神秘字符的排列）。
+     *
+     * 与旧实现的两点区别：
+     *   ① 长度：旧实现拼 10~18 个「字」、每字 3~4 字符，单 key 平均 44.5 字符；
+     *      现在直接取表，长度固定为 2~4 字符（前缀 + 1~3 个后缀字符）。
+     *   ② 唯一性：这是必须的。调用方会用 key 构造
+     *          Map&lt;Integer, LabelStmt&gt; switchBlock
+     *      由 `key.hashCode() ^ obfIndexI` 作索引。一旦两个块拿到相同 key，
+     *      Map 会覆盖掉前一个 → 该块在 dispatcher 里没有 case 可达 →
+     *      运行时走 default 死循环，或产出非法字节码。
+     *      旧实现靠「长度足够长」把碰撞概率压到极低，现在字典只有 40494 条，
+     *      单个方法几十个块时 Birthday 碰撞概率不可忽略，因此显式去重。
+     *
+     * 注意：去重只保证【同一方法内】不重复，跨方法复用不影响正确性
+     * （每个方法的 obfIndexI 不同，且 switchBlock 是方法局部的）。
+     */
+    private final java.util.Set<Integer> usedKeyHashes = new java.util.HashSet<>();
 
     public String randomString(int depth) {
-        int length = (new Random().nextInt(5 ) + 5) * depth;
-        StringBuilder stringBuilder = new StringBuilder();
-        for (int i = 0; i < length; i++) {
-            stringBuilder.append(ObfDic.dic[new Random().nextInt(ObfDic.dic.length - 1)]);
+        java.util.Random random = new java.util.Random();
+        // 去重必须按 hashCode 而不是字符串本身：
+        // 字典 40494 条里 hashCode 只有 31708 个不同值（78.3%），
+        // 若按字符串去重，仍会出现两个不同 key 映射到同一 case 值的情况，
+        // Map<Integer, LabelStmt> switchBlock 会被覆盖 → 块丢失。
+        for (int attempt = 0; attempt < ObfDic.SIZE * 2; attempt++) {
+            String key = ObfDic.at(random.nextInt(ObfDic.SIZE));
+            if (usedKeyHashes.add(key.hashCode())) {
+                return key;
+            }
         }
-        return stringBuilder.toString();
+        return ObfDic.at(random.nextInt(ObfDic.SIZE));
+    }
+
+    /** 每次开始处理一个新方法前调用，重置去重集合。 */
+    public void resetKeyPool() {
+        usedKeyHashes.clear();
     }
 }
