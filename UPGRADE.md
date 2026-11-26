@@ -69,8 +69,10 @@ dex2jar 2.4 把 `Value.vt` 改成 `final`，`SubObfuscator.java` 里两处
 v2.vt = Value.VT.SUB;
 v2.setOp2(Exprs.nInt(-increment));
 
-// 新
-e2.op2 = Exprs.nSub(v2.getOp1(), Exprs.nInt(-increment), "I");
+// 新 —— 注意必须补 valueType，否则 IR2JConverter NPE（见第六节 bug 2）
+Constant c = Exprs.nInt(-increment);
+c.valueType = "I";
+e2.op2 = Exprs.nSub(v2.getOp1(), c, "I");
 ```
 
 ### 5. 精简 `dex-tools`
@@ -112,6 +114,22 @@ java -cp "$CP" com.googlecode.dex2jar.tools.BlackObfuscatorCmd \
 > `if (remainingArgs.length == 0) { usage(); return; }`，不给位置参数就只打
 > usage 不干活。
 
+> `-p` 是**白名单**（只混淆这个包），不是黑名单；`splitDex` 的 `whiteList`
+> 为空会直接返回 0、什么都不做。想排除某个包用 `-a` 传 allowList 文件。
+
+排错时加 `-k`（`--keep`）保留中间产物：
+
+```bash
+java -cp "$CP" com.googlecode.dex2jar.tools.BlackObfuscatorCmd \
+  -d 2 -i classes.dex -o out.dex -p com.example -k x
+# keep: split=/tmp/xxxsplit.dex    ← 从原 dex 切出来的待混淆部分
+# keep: jar=/tmp/xxxobf.jar        ← 混淆后的 class，可用 javap 检查
+# keep: dex=/tmp/xxxobf.dex        ← 混淆后的片段 dex，会被合回 out.dex
+```
+
+`obf.jar` 是排查主要抓手 —— 用 `javap -p -c` 看方法体是
+`throw new RuntimeException("d2j fail translate: ...")` 还是真的被平坦化了。
+
 ## 四、实测结果（2026-11-27）
 
 用 `JMComic3v2.1.14` 的 classes.dex 测（1,018,520 B，DEX_035）：
@@ -119,13 +137,28 @@ java -cp "$CP" com.googlecode.dex2jar.tools.BlackObfuscatorCmd \
 | 项 | 结果 |
 |---|---|
 | 耗时 | **1.5 秒** |
-| 产物 | `out.dex` 2,306,380 B |
-| 体积变化 | **2.26 倍** |
-| 转译失败方法 | 9 个（万级方法里的零头，dex2jar 会写 `*-error.zip` 记录） |
+| 产物 | `out.dex` 2,347,336 B |
+| 体积变化 | **2.30 倍** |
+| 转译失败方法 | **0** |
+| ASM verifier 失败 | **0** |
+| d8 回转 dex | ✅ 0 error（1,057,792 B） |
+| dex2jar 反解 → d8 | ✅ 0 error（1,040,920 B） |
 
-**体积膨胀 2.26× 是平坦化的固有代价** —— 每个基本块要多 3~4 条分发指令
+**体积膨胀 2.3× 是平坦化的固有代价** —— 每个基本块要多 3~4 条分发指令
 （更新状态码 + goto 回 dispatcher + lookup-switch）。接入流水线前要评估：
-一个 69MB 的包全量混淆可能涨到 130MB+。
+一个 69MB 的包全量混淆可能涨到 160MB+。
+
+### 验证手段
+
+光看「命令没报错」不够 —— `BlackObfuscatorCmd` 会把翻译失败的方法
+静默替换成 `throw new RuntimeException("d2j fail translate: ...")`，
+产物 dex 依然是「合法」的，装到机器上才炸。建议三层验证：
+
+1. **ASM verifier**（最精确，直接给出指令序号）
+   `Analyzer(new BasicVerifier()).analyze(owner, methodNode)`
+   报错形如 `Expected J, but found .`，`.` = `UNINITIALIZED_VALUE`
+2. **d8 回转**：`java -Xmx3g -cp d8.jar com.android.tools.r8.D8 --release --output out full.dex`
+3. **往返**：`full.dex` → `Dex2jarCmd` → `d8`，确认能二次转回
 
 ## 五、已知边界
 
@@ -137,7 +170,99 @@ java -cp "$CP" com.googlecode.dex2jar.tools.BlackObfuscatorCmd \
 | 强度中等 | 状态码是「字符串 hash ^ 随机 index」，块 key 在 dex 里是明文字符串常量，反编译后需手工重建映射 —— 能挡「随手看」，挡不住「愿意花时间的人」 |
 | 与 anti-diff 冲突 | 平坦化后 anti-diff 的 E 变换（条件反折）失去意义 |
 
-## 六、升级过程中踩的坑（给后来者）
+## 六、修掉的 6 个 bug（平坦化产出非法字节码）
+
+这 6 个 bug 的**现象完全一样** —— `dx`/`d8` 转不回 dex：
+
+```
+dx:  SimException: local 0007: invalid
+d8:  NegativeArraySizeException: -384128459
+dex2jar: 方法被替换成 throw new RuntimeException("d2j fail translate: ...")
+```
+
+但根因各不相同，逐个靠「改一版、跑一遍」看不出方向。真正定位靠
+**ASM verifier 给出指令序号**（见上一节的验证手段）。
+
+### 1. `LBlock` 用了 `org.objectweb.asm2.Label`
+
+fork 内嵌的 `asm2` 与官方 ASM 9 的 `Label` 不是同一个类，类型转换直接
+`ClassCastException`。升级到官方 ASM 后统一改用 `org.objectweb.asm.Label`。
+
+### 2. `SubObfuscator` 里 `Exprs.nInt()` 没补 `valueType`
+
+`Constant` 的构造器**不设置** `valueType` —— dex2jar 靠 `TypeTransformer`
+在上游正常流程里统一补（`TypeTransformer.java:94`）。混淆器是**在 IR 转
+code 之前**插新表达式，那些常量没经过 transformer，`valueType` 为 null：
+
+```java
+// IR2JConverter:1174
+String t = constant.valueType;
+switch (t.charAt(0))   // ← NPE
+```
+
+NPE 被 `Dex2Asm` 捕获后整个方法替换成 throw。修法是显式赋值：
+`c.valueType = "I"`。
+
+### 3. `FlowObfuscator` 重复 `addAll(newBlock.getStmts())`
+
+外层已经加过一遍，内层 `if (nextKey != "")` 分支又加一遍 —— 每个带后继的
+基本块，指令在字节码里出现两遍。体积上看不出来（`deadCode` transformer
+会去重），但带副作用的指令（方法调用、字段写入）会被**执行两次**，改变
+程序行为。
+
+### 4. `newLocal` 的编号与已有 Local 冲突
+
+原实现：
+
+```java
+localIndex = ir.locals.size() * 2;          // reBuild 时重置
+Local local = Exprs.nLocal(++localIndex, name);
+```
+
+两个问题：`locals.size()` ≠ 最大 `_ls_index`；且 `Flow`/`Sub`/`If` 三个
+chain 各持一个实例、各自重置 → 分到同一批编号。改成扫当前最大值。
+
+### 5. `newLocal` 没算类型宽度（**这是最隐蔽的一个**）
+
+`long` / `double` 在 JVM 里占 **2 个槽位**。只按 `max + 1` 分配，一个新
+`int` 会正好落在某个 `long` 的第二个槽上，把那个 `long` 直接拆坏：
+
+```
+LLOAD 8
+PUTFIELD MainActivity.E:J
+verifier: Expected J, but found .
+```
+
+dex2jar 自己的 `Ir2JRegAssignTransformer` 是按宽度着色的
+（`excludeColor.get(i) && excludeColor.get(i + 1)`），这里必须保持一致：
+
+```java
+int end = l._ls_index + slotWidth(l.valueType);   // J/D 算 2
+```
+
+### 6. 槽位复用在 loop head 处的类型合并（**这才是主因**）
+
+平坦化把所有原基本块塞进同一个 `while`，**loop head 成了全部路径的汇合点**。
+verifier 在该点对每个 slot 做类型合并 —— 只要某个 slot 在**部分路径上没被
+写过**，合并结果就退化成 `UNINITIALIZED_VALUE`。
+
+原版 `FlowObfuscator` 那段看起来可疑的代码正是为此：
+
+```java
+local1._ls_index = newLocal("new_local", op2.valueType)._ls_index;
+newStmts.add(Stmts.nAssign(local1, getNullValue(op2)));
+```
+
+- 前半句：给每个被赋值的局部变量分配**独占**槽位 —— 原 dex 里同一个寄存器
+  会承载不同类型的不同变量，平坦化后这些变量在 loop head 汇合，类型必然冲突
+- 后半句：在**方法入口（while 之前）** 插一条初始化为 0/null 的赋值 —— 让
+  每个槽位在所有路径上都已初始化，合并结果才有定义
+
+**排查过程中我把这段当成 bug 删掉过**，结果错误从 `local 0005` 变成
+`local 0007`，一直找不到方向。教训：看不懂的「可疑代码」先确认它解决了
+什么问题，再判断是不是 bug。
+
+## 七、升级过程中踩的坑（给后来者）
 
 1. **`compile` → `implementation` 会丢依赖传递** —— 必须按需改成 `api`
    并启用 `java-library` 插件，否则一堆「cannot find symbol」

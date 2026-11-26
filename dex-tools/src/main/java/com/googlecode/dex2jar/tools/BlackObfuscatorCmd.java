@@ -53,6 +53,10 @@ public class BlackObfuscatorCmd extends BaseCmd {
     @Opt(opt = "a", longOpt = "allow", description = "Allow List File Path")
     private Path allowList;
 
+    /** 保留中间产物（split.dex / obf.jar / obf.dex），排查转换失败时必需 */
+    @Opt(opt = "k", longOpt = "keep", hasArg = false, description = "Keep intermediate files")
+    private boolean keep;
+
     /**
      * whileList
      */
@@ -98,7 +102,10 @@ public class BlackObfuscatorCmd extends BaseCmd {
             File finalTempJar = tempJar;
             File finalSplitDex = splitDex;
             File finalObfDex = obfDex;
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> deleteFile(finalTempJar, finalSplitDex, finalObfDex)));
+            if (!keep) {
+                Runtime.getRuntime().addShutdownHook(new Thread(
+                        () -> deleteFile(finalTempJar, finalSplitDex, finalObfDex)));
+            }
 
             long l = DexLib2Utils.splitDex(input.toFile(), splitDex, whileList, blackList);
             if (l <= 0) {
@@ -119,7 +126,13 @@ public class BlackObfuscatorCmd extends BaseCmd {
         } catch (Throwable t) {
             t.printStackTrace();
         } finally {
-            deleteFile(tempJar, splitDex, obfDex);
+            if (!keep) {
+                deleteFile(tempJar, splitDex, obfDex);
+            } else {
+                System.out.println("keep: split=" + splitDex);
+                System.out.println("keep: jar=" + tempJar);
+                System.out.println("keep: dex=" + obfDex);
+            }
         }
     }
 

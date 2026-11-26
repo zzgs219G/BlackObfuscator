@@ -68,24 +68,46 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 			}
 		}
 
-		for (Stmt origStmt : orig) {
-			if (origStmt.st == Stmt.ST.ASSIGN || origStmt.st == Stmt.ST.IDENTITY) {
-				Stmt.E2Stmt e2Stmt = (Stmt.E2Stmt) origStmt;
-				Value op1 = e2Stmt.getOp1();
-				if (op1.vt == Value.VT.LOCAL) {
-					Local local1 = (Local) op1;
-					if (e2Stmt.getOp2().vt != Value.VT.THIS_REF && e2Stmt.getOp2().vt != Value.VT.PARAMETER_REF) {
-						local1._ls_index = newLocal("new_local", e2Stmt.getOp2().valueType)._ls_index;
-						newStmts.add(Stmts.nAssign(local1, getNullValue(e2Stmt.getOp2())));
-					}
-				}
-			}
-		}
-
+		// ⚠️ 这段是平坦化能被 verifier 接受的关键，不能删：
+		//   平坦化把所有原基本块塞进同一个 while 循环，loop head 因此成为
+		//   全部块的汇合点。verifier 在该点对每个 slot 做类型合并，只要某个
+		//   slot 在部分路径上没写过，合并结果就退化为 UNINITIALIZED_VALUE：
+		//     dx: SimException: local 0007: invalid
+		//     d8: NegativeArraySizeException
+		//   （用 ASM verifier 可精确看到 "Expected an object reference, but found ."）
+		//
+		//   这里做两件事：
+		//     ① 给每个被赋值的局部变量分配【独占】槽位，彻底消除原方法里的
+		//        slot 复用（原 dex 里同一个寄存器会承载不同类型的不同变量）。
+		//     ② 在方法入口（while 之前）给它们插一条初始化为 0/null 的赋值，
+		//        使每个槽位在所有路径上都已初始化，合并结果有定义。
+		//   参数槽位（THIS_REF / PARAMETER_REF）不动：JVM 保证入口已初始化。
 		Local obfIndexFinal = newLocal("obf_index_final", "I");
 		Local obfIndex = newLocal("obf_index", "I");
 		Local obfStrHash = newLocal("obf_hash", "I");
 		Local obfStr = newLocal("obf_str", "Ljava/lang/String;");
+
+		// 每个局部变量独占槽位 + 入口初始化。必须在 newLocal 之前收集，
+		// 否则新 Local 也会被卷进下面的循环里。
+		List<Stmt> inits = new ArrayList<>();
+		for (Stmt origStmt : orig) {
+			if (origStmt.st != Stmt.ST.ASSIGN) {
+				continue;
+			}
+			Stmt.E2Stmt e2Stmt = (Stmt.E2Stmt) origStmt;
+			if (e2Stmt.getOp1().vt != Value.VT.LOCAL) {
+				continue;
+			}
+			Local local1 = (Local) e2Stmt.getOp1();
+			Value op2 = e2Stmt.getOp2();
+			if (op2.vt == Value.VT.THIS_REF || op2.vt == Value.VT.PARAMETER_REF) {
+				continue;
+			}
+			// 独占槽位：原方法里复用的 slot 被拆开，避免同一槽位在不同
+			// 路径上承载不同类型。
+			local1._ls_index = newLocal("new_local", op2.valueType)._ls_index;
+			inits.add(Stmts.nAssign(local1, getNullValue(op2)));
+		}
 
 		LBlock whileBlock = generateLBlock();
 
@@ -147,6 +169,8 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 
 		newStmts.add(Stmts.nAssign(obfIndexFinal, Exprs.nInt(obfIndexI)));
 		newStmts.add(Stmts.nAssign(obfStr, Exprs.nString(enter.getKey())));
+		// 入口初始化必须在 while 之前，才能让 loop head 的类型合并有定义。
+		newStmts.addAll(inits);
 		newStmts.add(whileBlock.getLabelStmt());
 
 		newStmts.add(Stmts.nAssign(obfStrHash, hashInvoke(obfStr)));
@@ -174,7 +198,11 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 			if (newBlock.getNextKey().length() != 0) {
 				Stmt stmt = newBlock.getStmts().get(newBlock.getStmts().size() - 1);
 				if (stmt.st != Stmt.ST.GOTO && stmt.st != Stmt.ST.RETURN && stmt.st != Stmt.ST.THROW) {
-					newStmts.addAll(newBlock.getStmts());
+					// ⚠️ 2026-11-27 修：这里原来还有一句
+					//     newStmts.addAll(newBlock.getStmts());
+					//   但上面第 179 行已经 add 过了，重复添加会让每个基本块的
+					//   指令在字节码里出现两遍 —— 不只是体积翻倍，带副作用的
+					//   指令（方法调用、字段写入）会被执行两次，改变程序行为。
 					newStmts.add(Stmts.nAssign(obfStr, Exprs.nString(newBlock.getNextKey())));
 					newStmts.add(Stmts.nGoto(whileBlock.getLabelStmt()));
 				}

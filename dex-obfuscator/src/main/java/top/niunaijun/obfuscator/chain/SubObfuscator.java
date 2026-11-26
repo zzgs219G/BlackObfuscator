@@ -62,13 +62,17 @@ public class SubObfuscator extends BaseObfuscatorChain {
                             // a=b+c	a=b-(-c)
                             int increment = (Integer) ((Constant) v2.getOp2()).value;
                             // vt 在 dex2jar 2.4 起是 final：构造新表达式替换整个 op2
-                            e2.op2 = Exprs.nSub(v2.getOp1(), Exprs.nInt(-increment), "I");
+                            Constant c = Exprs.nInt(-increment);
+                            c.valueType = "I";        // 必须补：否则 IR2JConverter NPE
+                            e2.op2 = Exprs.nSub(v2.getOp1(), c, "I");
                         }
                     } else if (v2.vt == Value.VT.SUB) {
                         if (v2.getOp2().vt == Value.VT.CONSTANT) {
                             // a=b-c	a=b+(-c)
                             int increment = (Integer) ((Constant) v2.getOp2()).value;
-                            e2.op2 = Exprs.nAdd(v2.getOp1(), Exprs.nInt(-increment), "I");
+                            Constant c = Exprs.nInt(-increment);
+                            c.valueType = "I";        // 必须补：否则 IR2JConverter NPE
+                            e2.op2 = Exprs.nAdd(v2.getOp1(), c, "I");
                         }
                     } else if (v2.vt == Value.VT.XOR) {
                         // a=a^b	(a ^ r) ^ (b ^ r)
