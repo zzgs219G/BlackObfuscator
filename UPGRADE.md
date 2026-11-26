@@ -137,12 +137,14 @@ java -cp "$CP" com.googlecode.dex2jar.tools.BlackObfuscatorCmd \
 | 项 | 结果 |
 |---|---|
 | 耗时 | **1.5 秒** |
-| 产物 | `out.dex` 2,347,336 B |
+| 产物 | `out.dex` 2,347,480 B |
 | 体积变化 | **2.30 倍** |
 | 转译失败方法 | **0** |
 | ASM verifier 失败 | **0** |
-| d8 回转 dex | ✅ 0 error（1,057,792 B） |
+| lookupswitch 乱序 | **0**（71 个全部升序） |
+| d8 回转 dex | ✅ 0 error（1,057,932 B） |
 | dex2jar 反解 → d8 | ✅ 0 error（1,040,920 B） |
+| 语义回归（JVM 实跑） | ✅ 7 项输出逐字一致 |
 
 **体积膨胀 2.3× 是平坦化的固有代价** —— 每个基本块要多 3~4 条分发指令
 （更新状态码 + goto 回 dispatcher + lookup-switch）。接入流水线前要评估：
@@ -152,13 +154,17 @@ java -cp "$CP" com.googlecode.dex2jar.tools.BlackObfuscatorCmd \
 
 光看「命令没报错」不够 —— `BlackObfuscatorCmd` 会把翻译失败的方法
 静默替换成 `throw new RuntimeException("d2j fail translate: ...")`，
-产物 dex 依然是「合法」的，装到机器上才炸。建议三层验证：
+产物 dex 依然是「合法」的，装到机器上才炸。建议**四层**验证：
 
 1. **ASM verifier**（最精确，直接给出指令序号）
    `Analyzer(new BasicVerifier()).analyze(owner, methodNode)`
    报错形如 `Expected J, but found .`，`.` = `UNINITIALIZED_VALUE`
 2. **d8 回转**：`java -Xmx3g -cp d8.jar com.android.tools.r8.D8 --release --output out full.dex`
 3. **往返**：`full.dex` → `Dex2jarCmd` → `d8`，确认能二次转回
+4. **在真 JVM 上跑**（最容易被忽略、但唯一能发现运行时错误的一层）
+
+第 4 层的重要性见下面这个真实案例：混淆产物在 1/2/3 全过的情况下，
+JVM 加载时直接 `VerifyError: Bad lookupswitch instruction`。原因见第七节 bug 7。
 
 ## 五、已知边界
 
@@ -170,9 +176,9 @@ java -cp "$CP" com.googlecode.dex2jar.tools.BlackObfuscatorCmd \
 | 强度中等 | 状态码是「字符串 hash ^ 随机 index」，块 key 在 dex 里是明文字符串常量，反编译后需手工重建映射 —— 能挡「随手看」，挡不住「愿意花时间的人」 |
 | 与 anti-diff 冲突 | 平坦化后 anti-diff 的 E 变换（条件反折）失去意义 |
 
-## 六、修掉的 6 个 bug（平坦化产出非法字节码）
+## 六、修掉的 7 个 bug
 
-这 6 个 bug 的**现象完全一样** —— `dx`/`d8` 转不回 dex：
+前 6 个的**现象完全一样** —— `dx`/`d8` 转不回 dex：
 
 ```
 dx:  SimException: local 0007: invalid
@@ -182,6 +188,8 @@ dex2jar: 方法被替换成 throw new RuntimeException("d2j fail translate: ..."
 
 但根因各不相同，逐个靠「改一版、跑一遍」看不出方向。真正定位靠
 **ASM verifier 给出指令序号**（见上一节的验证手段）。
+
+第 7 个更隐蔽：前 6 个修复后所有静态验证全过，它却在 JVM 加载时才炸。
 
 ### 1. `LBlock` 用了 `org.objectweb.asm2.Label`
 
@@ -261,6 +269,45 @@ newStmts.add(Stmts.nAssign(local1, getNullValue(op2)));
 **排查过程中我把这段当成 bug 删掉过**，结果错误从 `local 0005` 变成
 `local 0007`，一直找不到方向。教训：看不懂的「可疑代码」先确认它解决了
 什么问题，再判断是不是 bug。
+
+### 7. `lookupswitch` 的 match 键没排序（**唯一到运行时才暴露的一个**）
+
+现象和上面 6 个完全不同 —— dex 能生成、d8 能回转、verifier 全过，但真正
+在 JVM 上加载类时：
+
+```
+java.lang.VerifyError: Bad lookupswitch instruction
+  Location: com/demo/Sem.main([Ljava/lang/String;)V @142: lookupswitch
+```
+
+JVM 规范要求 `lookupswitch` 的 match 键**严格升序**，HotSpot 加载时校验。
+而混淆器按插入顺序造键：
+
+```java
+switchBlock.put(newBlock.getKey().hashCode() ^ obfIndexI, ...)
+// key 是随机字符串的 hashCode ^ 常量 → 正负、大小全随机
+```
+
+上游 dex2jar 从不排序也没事，因为 **DEX 的 sparse-switch 编码天然保证键
+升序**（dex 格式里就是有序差值表），来自 dex 的 IR 一定已经有序。混淆器
+是在 IR 层凭空造新 switch，破坏了这个隐含前提。
+
+#### 为什么前 3 层验证全都没发现
+
+| 手段 | 结果 | 原因 |
+|---|---|---|
+| d8 回转 dex | ✅ 通过 | DEX 的 sparse-switch 不要求有序 |
+| dx 回转 dex | ✅ 通过 | 同上 |
+| ASM Analyzer | ✅ 通过 | 只校验栈帧/类型，不校验 switch 表 |
+| **真 JVM 加载执行** | ❌ `VerifyError` | HotSpot 才校验 |
+
+**这是本项目最重要的一条教训**：中间格式合法（DEX / class 结构）≠
+目标 VM 能接受。混淆这种「改写字节码」的工具，必须让产物在目标运行时上
+真的跑一遍。
+
+修法是在 `IR2JConverter` 发射 lookupswitch 时做一次插入排序（键与 target
+同步移动）。选这里而不是改 `FlowObfuscator` / `IfObfuscator`，是因为它同时
+覆盖两条链路（`IfObfuscator` 也调 `Stmts.nLookupSwitch`），且对 IR 层无侵入。
 
 ## 七、升级过程中踩的坑（给后来者）
 
