@@ -69,6 +69,10 @@ public class Dex2jarCmd extends BaseCmd {
 
     private final ObfuscatorConfiguration obfuscatorConfiguration;
 
+    public Dex2jarCmd() {
+        this(null);
+    }
+
     public Dex2jarCmd(ObfuscatorConfiguration configuration) {
         this.obfuscatorConfiguration = configuration;
     }
@@ -125,7 +129,7 @@ public class Dex2jarCmd extends BaseCmd {
                             : exceptionFile;
                     System.err.println("Detail Error Information in File " + errorFile);
                     System.err.println(BaksmaliBaseDexExceptionHandler.REPORT_MESSAGE);
-                    handler.dump(errorFile, orginalArgs);
+                    handler.dump(errorFile, originalArgs);
                 }
             }
             // long endTS = System.currentTimeMillis();

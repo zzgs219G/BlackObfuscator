@@ -16,10 +16,10 @@
  */
 package com.googlecode.d2j.dex;
 
-import org.objectweb.asm2.AsmBridge;
-import org.objectweb.asm2.MethodVisitor;
-import org.objectweb.asm2.Opcodes;
-import org.objectweb.asm2.tree.MethodNode;
+import org.objectweb.asm.AsmBridge;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.tree.MethodNode;
 
 import com.googlecode.d2j.DexException;
 import com.googlecode.d2j.node.DexMethodNode;
@@ -34,7 +34,7 @@ public class ExDex2Asm extends Dex2Asm {
     @Override
     public void convertCode(DexMethodNode methodNode, MethodVisitor mv, ClzCtx clzCtx) {
         MethodVisitor mw = AsmBridge.searchMethodWriter(mv);
-        MethodNode mn = new MethodNode(Opcodes.ASM5, methodNode.access, methodNode.method.getName(),
+        MethodNode mn = new MethodNode(Opcodes.ASM9, methodNode.access, methodNode.method.getName(),
                 methodNode.method.getDesc(), null, null);
         try {
             super.convertCode(methodNode, mn, clzCtx);
@@ -48,7 +48,13 @@ public class ExDex2Asm extends Dex2Asm {
             }
         }
         // code convert ok, copy to MethodWriter and check for Size
-        mn.accept(mv);
+        try {
+            mn.accept(mv);
+        } catch (Exception e) {
+            System.out.println("Cannot convert " + clzCtx.classDescriptor);
+            if (exceptionHandler != null)
+                exceptionHandler.handleMethodTranslateException(methodNode.method, methodNode, mn, e);
+        }
         if (mw != null) {
             try {
                 AsmBridge.sizeOfMethodWriter(mw);

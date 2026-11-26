@@ -15,10 +15,10 @@
  */
 package com.googlecode.d2j.asm;
 
-import org.objectweb.asm2.ClassVisitor;
-import org.objectweb.asm2.MethodVisitor;
-import org.objectweb.asm2.Opcodes;
-import org.objectweb.asm2.Type;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
 
 /**
  * @author <a href="mailto:pxb1988@gmail.com">Panxiaobo</a>
@@ -30,13 +30,13 @@ public class LdcOptimizeAdapter extends MethodVisitor implements Opcodes {
      * @param mv
      */
     public LdcOptimizeAdapter(MethodVisitor mv) {
-        super(Opcodes.ASM4, mv);
+        super(ASM9, mv);
     }
 
     /*
      * (non-Javadoc)
      * 
-     * @see org.objectweb.asm2.MethodAdapter#visitLdcInsn(java.lang.Object)
+     * @see org.objectweb.asm.MethodAdapter#visitLdcInsn(java.lang.Object)
      */
     @Override
     public void visitLdcInsn(Object cst) {
@@ -120,7 +120,7 @@ public class LdcOptimizeAdapter extends MethodVisitor implements Opcodes {
     }
 
     public static ClassVisitor wrap(ClassVisitor cv) {
-        return cv == null ? null : new ClassVisitor(Opcodes.ASM4, cv) {
+        return cv == null ? null : new ClassVisitor(ASM9, cv) {
             @Override
             public MethodVisitor visitMethod(int access, String name, String desc, String signature, String[] exceptions) {
                 return wrap(super.visitMethod(access, name, desc, signature, exceptions));

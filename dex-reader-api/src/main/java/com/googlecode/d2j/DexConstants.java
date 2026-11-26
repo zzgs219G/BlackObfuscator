@@ -21,7 +21,7 @@ package com.googlecode.d2j;
  * @author <a href="mailto:pxb1988@gmail.com">Panxiaobo</a>
  * @version $Rev$
  */
-public abstract interface DexConstants {
+public interface DexConstants {
 
     int ACC_PUBLIC = 0x0001; // class, field, method
     int ACC_PRIVATE = 0x0002; // class, field, method
@@ -44,6 +44,10 @@ public abstract interface DexConstants {
     int ACC_CONSTRUCTOR = 0x10000;// constructor method (class or instance initializer)
     int ACC_DECLARED_SYNCHRONIZED = 0x20000;
 
+    int ACC_VISIBILITY_FLAGS = ACC_PUBLIC | ACC_PRIVATE | ACC_PROTECTED;
+    int ACC_DEX_HIDDEN_BIT = 0x00000020; // field, method (not native)
+    int ACC_DEX_HIDDEN_BIT_NATIVE = 0x00000200; // method (native)
+
     String ANNOTATION_DEFAULT_TYPE = "Ldalvik/annotation/AnnotationDefault;";
     String ANNOTATION_SIGNATURE_TYPE = "Ldalvik/annotation/Signature;";
     String ANNOTATION_THROWS_TYPE = "Ldalvik/annotation/Throws;";
@@ -52,8 +56,25 @@ public abstract interface DexConstants {
     String ANNOTATION_INNER_CLASS_TYPE = "Ldalvik/annotation/InnerClass;";
     String ANNOTATION_MEMBER_CLASSES_TYPE = "Ldalvik/annotation/MemberClasses;";
 
+    static int toMiniAndroidApiLevel(int dexVersion) {
+        if (dexVersion <= DEX_035 || dexVersion <= DEX_036) {
+            return 0;
+        } else if (dexVersion == DEX_037) {
+            return 24;
+        } else if (dexVersion == DEX_038) {
+            return 26;
+        } else {
+            return 28;
+        }
+    }
     int DEX_035 = 0x00303335;
+    @Deprecated
     int DEX_036 = 0x00303336;
+    // android 7.0, api 24
     int DEX_037 = 0x00303337;
+    // android 8.0, api 26
     int DEX_038 = 0x00303338;
+    // android 9.0, api 28
+    int DEX_039 = 0x00303339;
+    int DEX_040 = 0x00303340;
 }

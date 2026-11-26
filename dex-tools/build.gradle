@@ -1,39 +1,19 @@
-description = 'Dex Tools'
-apply plugin:'application'
+plugins {
+    id 'java-library'
+}
 
-mainClassName="com.googlecode.dex2jar.tools.BaseCmd"
+description = 'Dex Tools'
 
 dependencies {
-  compile project(':dex-translator')
-  compile project(':d2j-smali')
-  compile project(':d2j-jasmin')
-  compile project(':dex-writer')
-  compile project(':dex-obfuscator')
-  compile project(':d2j-base-cmd')
-  compile project(':dexlib2')
+  implementation 'org.ow2.asm:asm:9.11.1'
+  implementation 'org.ow2.asm:asm-tree:9.11.1'
+  implementation 'org.ow2.asm:asm-util:9.11.1'
+  implementation project(':dex-translator')
+  implementation project(':d2j-smali')
+  implementation project(':d2j-jasmin')
+  api project(':dex-writer')
+  api project(':dex-obfuscator')
+  api project(':d2j-base-cmd')
+  api project(':dexlib2')
+  api project(':dx')
 }
-
-task bin_gen(type: JavaExec) {
-    dependsOn jar
-    classpath sourceSets.main.runtimeClasspath
-    ext.binDir="$buildDir/generated-sources/bin"
-    outputs.dir file(ext.binDir)
-    main='com.googlecode.dex2jar.bin_gen.BinGen'
-    args=["$projectDir/src/main/bin_gen","$ext.binDir"]
-}
-applicationDistribution.from(bin_gen)
-//applicationDistribution.from('src/main/jars') {
-//  into("lib")
-//}
-applicationDistribution.from('open-source-license.txt') {
-  into("lib")
-}
-applicationDistribution.from("$parent.rootDir") {
-  include("NOTICE.txt")
-  include("LICENSE.txt")
-}
-
-startScripts.dependsOn bin_gen
-
-artifacts.archives distZip
-

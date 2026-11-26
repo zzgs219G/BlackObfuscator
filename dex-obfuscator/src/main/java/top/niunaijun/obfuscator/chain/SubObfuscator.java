@@ -61,15 +61,14 @@ public class SubObfuscator extends BaseObfuscatorChain {
                         if (v2.getOp2().vt == Value.VT.CONSTANT) {
                             // a=b+c	a=b-(-c)
                             int increment = (Integer) ((Constant) v2.getOp2()).value;
-                            v2.vt = Value.VT.SUB;
-                            v2.setOp2(Exprs.nInt(-increment));
+                            // vt 在 dex2jar 2.4 起是 final：构造新表达式替换整个 op2
+                            e2.op2 = Exprs.nSub(v2.getOp1(), Exprs.nInt(-increment), "I");
                         }
                     } else if (v2.vt == Value.VT.SUB) {
                         if (v2.getOp2().vt == Value.VT.CONSTANT) {
                             // a=b-c	a=b+(-c)
                             int increment = (Integer) ((Constant) v2.getOp2()).value;
-                            v2.vt = Value.VT.ADD;
-                            v2.setOp2(Exprs.nInt(-increment));
+                            e2.op2 = Exprs.nAdd(v2.getOp1(), Exprs.nInt(-increment), "I");
                         }
                     } else if (v2.vt == Value.VT.XOR) {
                         // a=a^b	(a ^ r) ^ (b ^ r)

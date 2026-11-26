@@ -1,22 +1,77 @@
 package com.googlecode.d2j.dex;
 
-import com.googlecode.d2j.*;
+import com.googlecode.d2j.DexConstants;
+import com.googlecode.d2j.DexType;
+import com.googlecode.d2j.Field;
+import com.googlecode.d2j.Method;
+import com.googlecode.d2j.MethodHandle;
+import com.googlecode.d2j.Proto;
+import com.googlecode.d2j.Visibility;
 import com.googlecode.d2j.converter.Dex2IRConverter;
 import com.googlecode.d2j.converter.IR2JConverter;
-import com.googlecode.d2j.node.*;
+import com.googlecode.d2j.node.DexAnnotationNode;
+import com.googlecode.d2j.node.DexClassNode;
+import com.googlecode.d2j.node.DexFieldNode;
+import com.googlecode.d2j.node.DexFileNode;
+import com.googlecode.d2j.node.DexMethodNode;
 import com.googlecode.dex2jar.ir.IrMethod;
-import com.googlecode.dex2jar.ir.ts.*;
+import com.googlecode.dex2jar.ir.ts.AggTransformer;
+import com.googlecode.dex2jar.ir.ts.CleanLabel;
+import com.googlecode.dex2jar.ir.ts.DeadCodeTransformer;
+import com.googlecode.dex2jar.ir.ts.EndRemover;
+import com.googlecode.dex2jar.ir.ts.ExceptionHandlerTrim;
+import com.googlecode.dex2jar.ir.ts.Ir2JRegAssignTransformer;
+import com.googlecode.dex2jar.ir.ts.MultiArrayTransformer;
+import com.googlecode.dex2jar.ir.ts.NewTransformer;
+import com.googlecode.dex2jar.ir.ts.NpeTransformer;
+import com.googlecode.dex2jar.ir.ts.RemoveConstantFromSSA;
+import com.googlecode.dex2jar.ir.ts.RemoveLocalFromSSA;
+import com.googlecode.dex2jar.ir.ts.TypeTransformer;
+import com.googlecode.dex2jar.ir.ts.UnSSATransformer;
+import com.googlecode.dex2jar.ir.ts.VoidInvokeTransformer;
+import com.googlecode.dex2jar.ir.ts.ZeroTransformer;
 import com.googlecode.dex2jar.ir.ts.array.FillArrayTransformer;
-import org.objectweb.asm2.*;
-import org.objectweb.asm2.signature.SignatureReader;
-import org.objectweb.asm2.signature.SignatureWriter;
-import org.objectweb.asm2.tree.InnerClassNode;
 
-import java.io.IOException;
+import org.objectweb.asm.AnnotationVisitor;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.FieldVisitor;
+import org.objectweb.asm.Handle;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
+import org.objectweb.asm.signature.SignatureReader;
+import org.objectweb.asm.signature.SignatureWriter;
+import org.objectweb.asm.tree.InnerClassNode;
+
 import java.io.InputStream;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.Stack;
 
 public class Dex2Asm {
+    private static boolean isPowerOfTwo(int i) {
+        return (i & (i - 1)) == 0;
+    }
+
+    private static int removeHiddenAccess(int accessFlags) {
+        // Refer to art/libdexfile/dex/hidden_api_access_flags.h
+        if (!isPowerOfTwo(accessFlags & DexConstants.ACC_VISIBILITY_FLAGS)) {
+            accessFlags ^= DexConstants.ACC_VISIBILITY_FLAGS;
+        }
+        accessFlags &= ~((accessFlags & DexConstants.ACC_NATIVE) != 0 ?
+                DexConstants.ACC_DEX_HIDDEN_BIT_NATIVE : DexConstants.ACC_DEX_HIDDEN_BIT);
+        return accessFlags;
+    }
+
     public static class ClzCtx {
         public String classDescriptor;
         public String hexDecodeMethodNamePrefix;
@@ -45,7 +100,7 @@ public class Dex2Asm {
 
         void addInner(Clz clz) {
             if (inners == null) {
-                inners = new HashSet<Clz>();
+                inners = new HashSet<>();
             }
             inners.add(clz);
         }
@@ -60,11 +115,10 @@ public class Dex2Asm {
                 return false;
             Clz other = (Clz) obj;
             if (name == null) {
-                if (other.name != null)
-                    return false;
-            } else if (!name.equals(other.name))
-                return false;
-            return true;
+                return other.name == null;
+            } else {
+                return name.equals(other.name);
+            }
         }
 
         @Override
@@ -240,7 +294,7 @@ public class Dex2Asm {
     }
 
     private static MethodVisitor collectBasicMethodInfo(DexMethodNode methodNode, ClassVisitor cv) {
-        String xthrows[] = null;
+        String[] xthrows = null;
         String signature = null;
         if (methodNode.anns != null) {
             for (DexAnnotationNode ann : methodNode.anns) {
@@ -279,7 +333,9 @@ public class Dex2Asm {
                     + " by changing its signature to null");
             signature = null;
         }
-        int access = methodNode.access;
+
+        // HiddenApiAccessFlags is valid for .dex but not for .class
+        int access = removeHiddenAccess(methodNode.access);
         // clear ACC_DECLARED_SYNCHRONIZED and ACC_CONSTRUCTOR from method flags
         final int cleanFlag = ~((DexConstants.ACC_DECLARED_SYNCHRONIZED | DexConstants.ACC_CONSTRUCTOR));
         access &= cleanFlag;
@@ -329,7 +385,7 @@ public class Dex2Asm {
                         }
                             break;
                         case DexConstants.ANNOTATION_MEMBER_CLASSES_TYPE: {
-                            Object ts[] = (Object[]) findAnnotationAttribute(ann, "value");
+                            Object[] ts = (Object[]) findAnnotationAttribute(ann, "value");
                             for (Object v : ts) {
                                 DexType type = (DexType) v;
                                 Clz inner = get(classes, type.desc);
@@ -406,7 +462,7 @@ public class Dex2Asm {
                 }
             }
         }
-        String interfaceInterNames[] = null;
+        String[] interfaceInterNames = null;
         if (classNode.interfaceNames != null) {
             interfaceInterNames = new String[classNode.interfaceNames.length];
             for (int i = 0; i < classNode.interfaceNames.length; i++) {
@@ -434,7 +490,7 @@ public class Dex2Asm {
         cv.visit(version, access, toInternalName(classNode.className), signature,
                 classNode.superClass == null ? null : toInternalName(classNode.superClass), interfaceInterNames);
 
-        List<InnerClassNode> innerClassNodes = new ArrayList<InnerClassNode>(5);
+        List<InnerClassNode> innerClassNodes = new ArrayList<>(5);
         if (clzInfo != null) {
             searchInnerClass(clzInfo, innerClassNodes, classNode.className);
         }
@@ -476,30 +532,56 @@ public class Dex2Asm {
                 convertMethod(classNode, methodNode, cv, clzCtx);
             }
             if (clzCtx.hexDecodeMethodNamePrefix != null) {
-                addHexDecodeMethod(cv, clzCtx.hexDecodeMethodNamePrefix);
+                addHexDecodeMethod(cv, classNode.className.replaceFirst("^L", "").replaceAll(";$", ""),
+                        clzCtx.hexDecodeMethodNamePrefix);
             }
         }
         cv.visitEnd();
     }
-    private void addHexDecodeMethod(ClassVisitor outCV, String hexDecodeMethodNameBase) {
-        // the .data is a class file compiled from res.Hex
-        try (InputStream is = Dex2Asm.class.getResourceAsStream("/d2j_hex_decode_stub.data")) {
+
+    private static final String HEX_CLASS_LOCATION = "res/Hex";
+
+    private static final Set<String> HEX_DECODE_METHODS =
+            new HashSet<>(Arrays.asList("decode_J", "decode_I", "decode_S", "decode_B"));
+
+    protected InputStream getHexClassAsStream() {
+        return Dex2Asm.class.getResourceAsStream("/" + HEX_CLASS_LOCATION + ".class");
+    }
+
+    private void addHexDecodeMethod(ClassVisitor outCV, String className, String hexDecodeMethodNameBase) {
+        InputStream hexClassStream = getHexClassAsStream();
+        if (hexClassStream == null) {
+            return;
+        }
+
+        try (InputStream is = hexClassStream) {
             ClassReader cr = new ClassReader(is);
-            cr.accept(new ClassVisitor(Opcodes.ASM5) {
+            cr.accept(new ClassVisitor(Opcodes.ASM9) {
                 @Override
-                public MethodVisitor visitMethod(int access, String name, String desc, String signature, String[] exceptions) {
-                    if (name.startsWith("decode")) {
-                        return outCV.visitMethod(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
-                                hexDecodeMethodNameBase + "$" + name,
-                                desc, signature, exceptions
-                        );
+                public MethodVisitor visitMethod(int access, String name, String desc, String signature,
+                                                 String[] exceptions) {
+                    if (HEX_DECODE_METHODS.contains(name)) {
+                        return new MethodVisitor(Opcodes.ASM9,
+                                outCV.visitMethod(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
+                                        hexDecodeMethodNameBase + "$" + name, desc, signature, exceptions)) {
+                            @Override
+                            public void visitMethodInsn(int opcode, String owner, String name, String descriptor,
+                                                        boolean isInterface) {
+                                if (owner.equals(HEX_CLASS_LOCATION)) {
+                                    super.visitMethodInsn(opcode, className, hexDecodeMethodNameBase + "$" + name,
+                                            descriptor, isInterface);
+                                } else {
+                                    super.visitMethodInsn(opcode, owner, name, descriptor, isInterface);
+                                }
+                            }
+                        };
                     } else {
                         return super.visitMethod(access, name, desc, signature, exceptions);
                     }
                 }
             }, ClassReader.EXPAND_FRAMES);
-        } catch (IOException e) {
-            throw new RuntimeException("fail to add hex.decode", e);
+        } catch (Throwable t) {
+            throw new RuntimeException("Failed to add " + HEX_CLASS_LOCATION + ".decode_*", t);
         }
     }
     public void convertCode(DexMethodNode methodNode, MethodVisitor mv, ClzCtx clzCtx) {
@@ -523,7 +605,7 @@ public class Dex2Asm {
             for (DexAnnotationNode ann : fieldNode.anns) {
                 if (ann.visibility == Visibility.SYSTEM) {
                     switch (ann.type) {
-                    case DexConstants.ANNOTATION_SIGNATURE_TYPE: {
+                    case DexConstants.ANNOTATION_SIGNATURE_TYPE:
                         Object[] strs = (Object[]) findAnnotationAttribute(ann, "value");
                         if (strs != null) {
                             StringBuilder sb = new StringBuilder();
@@ -532,7 +614,6 @@ public class Dex2Asm {
                             }
                             signature = sb.toString();
                         }
-                    }
                         break;
                     }
                 }
@@ -550,10 +631,11 @@ public class Dex2Asm {
             signature = null;
         }
 
-
+        // HiddenApiAccessFlags is valid for .dex but not for .class
+        int access = removeHiddenAccess(fieldNode.access);
         final int fieldCleanFlag = ~((DexConstants.ACC_DECLARED_SYNCHRONIZED | Opcodes.ACC_SYNTHETIC));
-        FieldVisitor fv = cv.visitField(fieldNode.access & fieldCleanFlag, fieldNode.field.getName(),
-                    fieldNode.field.getType(), signature, value);
+        FieldVisitor fv = cv.visitField(access & fieldCleanFlag, fieldNode.field.getName(),
+                fieldNode.field.getType(), signature, value);
 
         if (fv == null) {
             return;
@@ -563,7 +645,7 @@ public class Dex2Asm {
     }
 
     /**
-     * @see org.objectweb.asm2.commons.Remapper#mapSignature(String, boolean)
+     * @see org.objectweb.asm.commons.Remapper#mapSignature(String, boolean)
      */
     private static boolean isSignatureNotValid(String signature, boolean typeSignature) {
         if (signature == null) {
@@ -585,6 +667,9 @@ public class Dex2Asm {
     }
 
     public static Object[] convertConstantValues(Object[] v) {
+        if (v == null) {
+            return null;
+        }
         Object[] copy = Arrays.copyOf(v, v.length);
         for (int i = 0; i < copy.length; i++) {
             Object ele = copy[i];
@@ -598,42 +683,45 @@ public class Dex2Asm {
         if (ele instanceof DexType) {
             ele = Type.getType(((DexType) ele).desc);
         } else if (ele instanceof MethodHandle) {
-            Handle h = null;
-            MethodHandle mh = (MethodHandle) ele;
-            switch (mh.getType()) {
-                case MethodHandle.INSTANCE_GET:
-                    h = new Handle(Opcodes.H_GETFIELD, toInternalName(mh.getField().getOwner()), mh.getField().getName(), mh.getField().getType());
-                    break;
-                case MethodHandle.INSTANCE_PUT:
-                    h = new Handle(Opcodes.H_PUTFIELD, toInternalName(mh.getField().getOwner()), mh.getField().getName(), mh.getField().getType());
-                    break;
-                case MethodHandle.STATIC_GET:
-                    h = new Handle(Opcodes.H_GETFIELD, toInternalName(mh.getField().getOwner()), mh.getField().getName(), mh.getField().getType());
-                    break;
-                case MethodHandle.STATIC_PUT:
-                    h = new Handle(Opcodes.H_PUTFIELD, toInternalName(mh.getField().getOwner()), mh.getField().getName(), mh.getField().getType());
-                    break;
-                case MethodHandle.INVOKE_INSTANCE:
-                    h = new Handle(Opcodes.H_INVOKEVIRTUAL, toInternalName(mh.getMethod().getOwner()), mh.getMethod().getName(), mh.getMethod().getDesc());
-                    break;
-                case MethodHandle.INVOKE_STATIC:
-                    h = new Handle(Opcodes.H_INVOKESTATIC, toInternalName(mh.getMethod().getOwner()), mh.getMethod().getName(), mh.getMethod().getDesc());
-                    break;
-                case MethodHandle.INVOKE_CONSTRUCTOR:
-                    h = new Handle(Opcodes.H_NEWINVOKESPECIAL, toInternalName(mh.getMethod().getOwner()), mh.getMethod().getName(), mh.getMethod().getDesc());
-                    break;
-                case MethodHandle.INVOKE_DIRECT:
-                    h = new Handle(Opcodes.H_INVOKESPECIAL, toInternalName(mh.getMethod().getOwner()), mh.getMethod().getName(), mh.getMethod().getDesc());
-                    break;
-                case MethodHandle.INVOKE_INTERFACE:
-                    h = new Handle(Opcodes.H_INVOKEINTERFACE, toInternalName(mh.getMethod().getOwner()), mh.getMethod().getName(), mh.getMethod().getDesc());
-                    break;
-            }
-            ele = h;
+            ele = convertHandler((MethodHandle) ele);
         } else if (ele instanceof Proto) {
             ele = Type.getMethodType(((Proto) ele).getDesc());
         }
         return ele;
+    }
+
+    public static Handle convertHandler(MethodHandle ele) {
+        Handle h = null;
+        switch (ele.getType()) {
+            case MethodHandle.INSTANCE_GET:
+                h = new Handle(Opcodes.H_GETFIELD, toInternalName(ele.getField().getOwner()), ele.getField().getName(), ele.getField().getType(), false);
+                break;
+            case MethodHandle.INSTANCE_PUT:
+                h = new Handle(Opcodes.H_PUTFIELD, toInternalName(ele.getField().getOwner()), ele.getField().getName(), ele.getField().getType(), false);
+                break;
+            case MethodHandle.STATIC_GET:
+                h = new Handle(Opcodes.H_GETSTATIC, toInternalName(ele.getField().getOwner()), ele.getField().getName(), ele.getField().getType(), false);
+                break;
+            case MethodHandle.STATIC_PUT:
+                h = new Handle(Opcodes.H_PUTSTATIC, toInternalName(ele.getField().getOwner()), ele.getField().getName(), ele.getField().getType(), false);
+                break;
+            case MethodHandle.INVOKE_INSTANCE:
+                h = new Handle(Opcodes.H_INVOKEVIRTUAL, toInternalName(ele.getMethod().getOwner()), ele.getMethod().getName(), ele.getMethod().getDesc(), false);
+                break;
+            case MethodHandle.INVOKE_STATIC:
+                h = new Handle(Opcodes.H_INVOKESTATIC, toInternalName(ele.getMethod().getOwner()), ele.getMethod().getName(), ele.getMethod().getDesc(), false);
+                break;
+            case MethodHandle.INVOKE_CONSTRUCTOR:
+                h = new Handle(Opcodes.H_NEWINVOKESPECIAL, toInternalName(ele.getMethod().getOwner()), ele.getMethod().getName(), ele.getMethod().getDesc(), false);
+                break;
+            case MethodHandle.INVOKE_DIRECT:
+                h = new Handle(Opcodes.H_INVOKESPECIAL, toInternalName(ele.getMethod().getOwner()), ele.getMethod().getName(), ele.getMethod().getDesc(), false);
+                break;
+            case MethodHandle.INVOKE_INTERFACE:
+                h = new Handle(Opcodes.H_INVOKEINTERFACE, toInternalName(ele.getMethod().getOwner()), ele.getMethod().getName(), ele.getMethod().getDesc(), true);
+                break;
+        }
+        return h;
     }
 
     public void convertMethod(DexClassNode classNode, DexMethodNode methodNode, ClassVisitor cv, ClzCtx clzCtx) {

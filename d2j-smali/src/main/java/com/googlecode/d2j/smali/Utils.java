@@ -3,6 +3,7 @@ package com.googlecode.d2j.smali;
 import com.googlecode.d2j.DexConstants;
 import com.googlecode.d2j.Field;
 import com.googlecode.d2j.Method;
+import com.googlecode.d2j.Proto;
 import com.googlecode.d2j.Visibility;
 import com.googlecode.d2j.reader.Op;
 import com.googlecode.d2j.visitors.DexAnnotationVisitor;
@@ -38,50 +39,51 @@ public class Utils implements DexConstants {
     }
 
     public static int getAcc(String name) {
-        if (name.equals("public")) {
+        switch (name) {
+        case "public":
             return ACC_PUBLIC;
-        } else if (name.equals("private")) {
+        case "private":
             return ACC_PRIVATE;
-        } else if (name.equals("protected")) {
+        case "protected":
             return ACC_PROTECTED;
-        } else if (name.equals("static")) {
+        case "static":
             return ACC_STATIC;
-        } else if (name.equals("final")) {
+        case "final":
             return ACC_FINAL;
-        } else if (name.equals("synchronized")) {
+        case "synchronized":
             return ACC_SYNCHRONIZED;
-        } else if (name.equals("volatile")) {
+        case "volatile":
             return ACC_VOLATILE;
-        } else if (name.equals("bridge")) {
+        case "bridge":
             return ACC_BRIDGE;
-        } else if (name.equals("varargs")) {
+        case "varargs":
             return ACC_VARARGS;
-        } else if (name.equals("transient")) {
+        case "transient":
             return ACC_TRANSIENT;
-        } else if (name.equals("native")) {
+        case "native":
             return ACC_NATIVE;
-        } else if (name.equals("interface")) {
+        case "interface":
             return ACC_INTERFACE;
-        } else if (name.equals("abstract")) {
+        case "abstract":
             return ACC_ABSTRACT;
-        } else if (name.equals("strict")) {
+        case "strict":
             return ACC_STRICT;
-        } else if (name.equals("synthetic")) {
+        case "synthetic":
             return ACC_SYNTHETIC;
-        } else if (name.equals("annotation")) {
+        case "annotation":
             return ACC_ANNOTATION;
-        } else if (name.equals("enum")) {
+        case "enum":
             return ACC_ENUM;
-        } else if (name.equals("constructor")) {
+        case "constructor":
             return ACC_CONSTRUCTOR;
-        } else if (name.equals("declared-synchronized")) {
+        case "declared-synchronized":
             return ACC_DECLARED_SYNCHRONIZED;
         }
         return 0;
     }
 
     public static List<String> listDesc(String desc) {
-        List<String> list = new ArrayList(5);
+        List<String> list = new ArrayList<>(5);
         if (desc == null) {
             return list;
         }
@@ -139,11 +141,11 @@ public class Utils implements DexConstants {
     }
 
     static public Byte parseByte(String str) {
-        return Byte.valueOf((byte) parseInt(str.substring(0, str.length() - 1)));
+        return (byte) parseInt(str.substring(0, str.length() - 1));
     }
 
     static public Short parseShort(String str) {
-        return Short.valueOf((short) parseInt(str.substring(0, str.length() - 1)));
+        return (short) parseInt(str.substring(0, str.length() - 1));
     }
 
     static public Long parseLong(String str) {
@@ -200,7 +202,7 @@ public class Utils implements DexConstants {
         if (str.equals("infinity")) {
             return x < 0 ? Float.NEGATIVE_INFINITY : Float.POSITIVE_INFINITY;
         }
-        return (float) x * Float.parseFloat(str);
+        return x * Float.parseFloat(str);
     }
 
     static public double parseDouble(String str) {
@@ -268,7 +270,7 @@ public class Utils implements DexConstants {
     }
 
     public static int[] toIntArray(List<String> ss) {
-        int vs[] = new int[ss.size()];
+        int[] vs = new int[ss.size()];
         for (int i = 0; i < ss.size(); i++) {
             vs[i] = parseInt(ss.get(i));
         }
@@ -276,14 +278,14 @@ public class Utils implements DexConstants {
     }
 
     public static byte[] toByteArray(List<Object> ss) {
-        byte vs[] = new byte[ss.size()];
+        byte[] vs = new byte[ss.size()];
         for (int i = 0; i < ss.size(); i++) {
             vs[i] = ((Number) (ss.get(i))).byteValue();
         }
         return vs;
     }
 
-    static Map<String, Op> ops = new HashMap();
+    static Map<String, Op> ops = new HashMap<>();
 
     static {
         for (Op op : Op.values()) {
@@ -321,7 +323,6 @@ public class Utils implements DexConstants {
                         i += 2;
                         break;
                     case 'u':
-                        String sub = str.substring(i + 2, i + 6);
                         i += 6;
                         break;
                     default:
@@ -423,10 +424,10 @@ public class Utils implements DexConstants {
 
     public static class Ann {
         public String name;
-        public List<Map.Entry<String, Object>> elements = new ArrayList();
+        public List<Map.Entry<String, Object>> elements = new ArrayList<>();
 
         public void put(String name, Object value) {
-            elements.add(new java.util.AbstractMap.SimpleEntry(name, value));
+            elements.add(new java.util.AbstractMap.SimpleEntry<>(name, value));
         }
     }
 
@@ -477,23 +478,30 @@ public class Utils implements DexConstants {
         return -1;
     }
 
-    public static Method parseMethodAndUnescape(String owner, String part) throws RuntimeException {
-        int x = part.indexOf('(');
-        if (x < 0) {
-            throw new RuntimeException();
-        }
+    public static Proto parseProtoAndUnescape(String part) throws RuntimeException {
+        int x = 0;
         int y = part.indexOf(')', x);
         if (y < 0) {
             throw new RuntimeException();
         }
 
-        String methodName = unEscapeId(part.substring(0, x));
         String[] params = toTypeList(part.substring(x + 1, y));
         for (int i = 0; i < params.length; i++) {
             params[i] = unEscapeId(params[i]);
         }
         String ret = unEscapeId(part.substring(y + 1));
-        return new Method(owner, methodName, params, ret);
+        return new Proto(params, ret);
+    }
+
+    public static Method parseMethodAndUnescape(String owner, String part) throws RuntimeException {
+        int x = part.indexOf('(');
+        if (x < 0) {
+            throw new RuntimeException();
+        }
+
+        String methodName = unEscapeId(part.substring(0, x));
+
+        return new Method(owner, methodName, parseProtoAndUnescape(part.substring(x)));
     }
 
     public static Method parseMethodAndUnescape(String full) throws RuntimeException {

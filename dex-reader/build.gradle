@@ -1,8 +1,13 @@
+plugins {
+    id 'java-library'
+}
+
 description = 'Dex Reader'
 
 dependencies {
-    compile project(':dex-reader-api')
-    testCompile (group: 'org.apache.commons', name: 'commons-compress', version:'1.4.1')
+  implementation 'org.ow2.asm:asm:9.11.1'
+    api project(':dex-reader-api')
+    testImplementation (group: 'org.apache.commons', name: 'commons-compress', version:'1.28.0')
 }
 
 

@@ -16,8 +16,13 @@
  */
 package com.googlecode.d2j.converter;
 
+import top.niunaijun.obfuscator.IRObfuscator;
+import top.niunaijun.obfuscator.ObfuscatorConfiguration;
+
+import com.googlecode.d2j.CallSite;
 import com.googlecode.d2j.DexType;
 import com.googlecode.d2j.Method;
+import com.googlecode.d2j.MethodHandle;
 import com.googlecode.d2j.Proto;
 import com.googlecode.d2j.asm.LdcOptimizeAdapter;
 import com.googlecode.d2j.dex.Dex2Asm;
@@ -31,9 +36,7 @@ import com.googlecode.dex2jar.ir.expr.Value.VT;
 import com.googlecode.dex2jar.ir.stmt.*;
 import com.googlecode.dex2jar.ir.stmt.Stmt.E2Stmt;
 import com.googlecode.dex2jar.ir.stmt.Stmt.ST;
-import org.objectweb.asm2.*;
-import top.niunaijun.obfuscator.IRObfuscator;
-import top.niunaijun.obfuscator.ObfuscatorConfiguration;
+import org.objectweb.asm.*;
 
 import java.lang.reflect.Array;
 import java.nio.ByteBuffer;
@@ -44,13 +47,18 @@ import java.util.Map;
 @SuppressWarnings("incomplete-switch")
 public class IR2JConverter implements Opcodes {
 
+    ObfuscatorConfiguration obf;
+
+    public IR2JConverter obf(ObfuscatorConfiguration obf) {
+        this.obf = obf;
+        return this;
+    }
+
     public static final int MAX_FILL_ARRAY_BYTES = 500;
     private boolean optimizeSynchronized = false;
     Dex2Asm.ClzCtx clzCtx;
     IrMethod ir;
     MethodVisitor asm;
-    ObfuscatorConfiguration obf;
-
     public IR2JConverter() {
         super();
     }
@@ -75,14 +83,9 @@ public class IR2JConverter implements Opcodes {
         return this;
     }
 
-    public IR2JConverter obf(ObfuscatorConfiguration obf) {
-        this.obf = obf;
-        return this;
-    }
-
     public void convert() {
         mapLabelStmt(ir);
-        reBuildInstructions(ir, obf, asm);
+        reBuildInstructions(ir, asm);
         reBuildTryCatchBlocks(ir, asm);
     }
 
@@ -126,17 +129,18 @@ public class IR2JConverter implements Opcodes {
         return Type.getType(n).getInternalName();
     }
 
-    private void reBuildInstructions(IrMethod ir, ObfuscatorConfiguration obf, MethodVisitor asm) {
+
+
+    private void reBuildInstructions(IrMethod ir, MethodVisitor asm) {
+        if (obf != null) {
+            IRObfuscator.get(obf).reBuildInstructions(ir);
+        }
         asm = new LdcOptimizeAdapter(asm);
-        Map<String, Integer> lockMap = new HashMap<String, Integer>();
-
-        IRObfuscator.get(obf).reBuildInstructions(ir);
-
         int maxLocalIndex = 0;
         for (Local local : ir.locals) {
             maxLocalIndex = Math.max(maxLocalIndex, local._ls_index);
         }
-
+        Map<String, Integer> lockMap = new HashMap<String, Integer>();
         for (Stmt st : ir.stmts) {
             switch (st.st) {
             case LABEL:
@@ -690,8 +694,8 @@ public class IR2JConverter implements Opcodes {
                 Constant cst = (Constant) value;
                 if (cst.value.equals(Constant.Null)) {
                     asm.visitInsn(ACONST_NULL);
-                } else if (cst.value instanceof DexType) {
-                    asm.visitLdcInsn(Type.getType(((DexType) cst.value).desc));
+                } else if (cst.value instanceof DexType || cst.value instanceof MethodHandle || cst.value instanceof Proto) {
+                    asm.visitLdcInsn(Dex2Asm.convertConstantValue(cst.value));
                 } else {
                     asm.visitLdcInsn(cst.value);
                 }
@@ -826,7 +830,7 @@ public class IR2JConverter implements Opcodes {
             if (ie.vt == VT.INVOKE_NEW) {
                 p = new Proto(p.getParameterTypes(), "V");
             }
-            asm.visitMethodInsn(opcode, toInternal(ie.getOwner()), ie.getName(), p.getDesc());
+            asm.visitMethodInsn(opcode, toInternal(ie.getOwner()), ie.getName(), p.getDesc(), opcode == INVOKEINTERFACE);
         }
         break;
         case INVOKE_CUSTOM: {
@@ -849,7 +853,10 @@ public class IR2JConverter implements Opcodes {
             } else {
                 throw new RuntimeException();
             }
-            asm.visitInvokeDynamicInsn(ice.name, ice.proto.getDesc(), (Handle) Dex2Asm.convertConstantValue(ice.handle), Dex2Asm.convertConstantValues(ice.bsmArgs));
+            CallSite callSite = ice.callSite;
+            asm.visitInvokeDynamicInsn(callSite.getMethodName(), callSite.getMethodProto().getDesc(),
+                    Dex2Asm.convertHandler(callSite.getBootstrapMethodHandler()),
+                    Dex2Asm.convertConstantValues(callSite.getExtraArguments()));
         }
         break;
         case INVOKE_POLYMORPHIC: {

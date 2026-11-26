@@ -20,7 +20,7 @@ import org.antlr.runtime.ANTLRReaderStream;
 import org.antlr.runtime.ANTLRStringStream;
 import org.antlr.runtime.CommonTokenStream;
 import org.antlr.runtime.RecognitionException;
-import org.objectweb.asm2.tree.ClassNode;
+import org.objectweb.asm.tree.ClassNode;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
@@ -46,6 +46,6 @@ public class Jasmins {
     }
 
     public static ClassNode parse(String fileName, InputStream is) throws IOException, RecognitionException {
-        return parse(fileName, new InputStreamReader(is, "UTF-8"));
+        return parse(fileName, new InputStreamReader(is, StandardCharsets.UTF_8));
     }
 }

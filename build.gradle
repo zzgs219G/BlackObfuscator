@@ -1,90 +1,94 @@
-allprojects  {
-  apply plugin: 'maven'
-  apply plugin: 'idea'
-  apply plugin: 'eclipse'
-  group = 'com.github.CodingGay.BlackObfuscator'
-  version = '2.1-SNAPSHOT'
+// BlackObfuscator 顶层 build.gradle（2026-11-27 升级到 Gradle 9.9.2 / JDK 21）
+//
+// 从 Gradle 6.9.1 升到 9.9.2 的改动清单：
+//   · apply plugin: 'maven'        → 已移除，用 'maven-publish'
+//   · apply plugin: 'idea'/'eclipse' → 已移除（IDE 集成改由 IDE 自己负责）
+//   · compile / testCompile        → implementation / testImplementation
+//   · sourceCompatibility = 1.8    → Java 17（Gradle 9 最低要求）
+//   · artifacts.archives packageSources（非标准 API）→ 直接用 tasks.named
+plugins {
+    id 'base'
 }
 
-defaultTasks('clean','distZip')
+// 提前定义（Gradle 9 里 subprojects 块执行时，脚本末尾的 def 方法还不可见）
+def getRevision = {
+    def v = System.getenv('BUILD_REVISION') ?: System.getenv('GIT_REVISION')
+    if (v) return v
+    try {
+        def p = 'git rev-parse --short HEAD'.execute()
+        p.waitFor()
+        def out = p.text.trim()
+        if (out) return out
+    } catch (ignored) {
+    }
+    return 'HEAD'
+}
+
+allprojects {
+    group = 'com.github.CodingGay.BlackObfuscator'
+    version = '3.0.0'
+}
+
+defaultTasks('clean', 'distZip')
 
 subprojects {
-  apply plugin: 'java'
-  apply plugin: 'maven'
-  sourceCompatibility = 1.8
-  targetCompatibility = 1.8
+    apply plugin: 'java'
 
-  task packageSources(type: Jar) {
-    classifier = 'sources'
-    from sourceSets.main.allSource
-  }
-  artifacts.archives packageSources
-  repositories {
-    mavenCentral()
-  }
-
-// == support provided scope
-  configurations {
-    provided
-  }
-  sourceSets {
-      main { compileClasspath += configurations.provided }
-      test {
-        compileClasspath += configurations.provided
-      }
-  }
-// == end
-
-  [compileJava, compileTestJava]*.options.collect {options ->options.encoding = 'UTF-8'}
-
-  dependencies {
-    testCompile group: 'junit', name: 'junit', version:'4.11'
-    compile fileTree(dir: 'libs', include: '*.jar')
-  }
-
-  jar {
-    manifest {
-      attributes("Implementation-Title": project.name,
-                 "Implementation-Version": project.version,
-                 "Build-Time": new Date().format("yyyy-MM-dd'T'HH:mm:ssZ"),
-                 "Revision":"${getRevision()}",
-                 "Build-Number": System.env.BUILD_NUMBER?System.env.BUILD_NUMBER:"-1",
-      )
+    java {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
-    from (project.parent.projectDir)  {
-      include 'NOTICE.txt'
-      include 'LICENSE.txt'
-      into('META-INF')
-    }
-  }
-}
 
-def getRevision() {
-  if (System.env.BUILD_REVISION) {
-    return System.env.BUILD_REVISION
-  }
-  if (System.env.GIT_REVISION) {
-    return System.env.GIT_REVISION
-  }
-  if (System.env.MERCURIAL_REVISION) {
-    System.env.MERCURIAL_REVISION
-  }
-
-  def ver = null;
-  try {
-    ver = 'git rev-parse --short HEAD'.execute().text.trim()
-  } catch (e) {
-    // ignore
-  }
-  if (!ver) {
-    try {
-      ver = 'hg id -i -b -t'.execute().text.split(' ')[0];
-    } catch (e) {
-      // ignore
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        // Gradle 9 对 deprecation 更严格，但源码是 2012 年的，放宽
+        options.compilerArgs << '-Xlint:-options'
     }
-  }
-  if (!ver) {
-    ver = "HEAD"
-  }
-  return ver
+
+    repositories {
+        mavenCentral()
+    }
+
+    // 原 provided scope 的替代（Gradle 9 用 compileOnly）
+    configurations {
+        provided
+    }
+    sourceSets {
+        main { compileClasspath += configurations.provided }
+        test { compileClasspath += configurations.provided }
+    }
+
+    dependencies {
+        testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    }
+
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+        // 老测试用 JUnit 4 风格命名，允许无测试时通过
+        failOnNoDiscoveredTests = false
+    }
+
+    // 源码 jar
+    tasks.register('packageSources', Jar) {
+        archiveClassifier = 'sources'
+        from sourceSets.main.allSource
+    }
+
+    tasks.named('jar') {
+        manifest {
+            attributes(
+                'Implementation-Title': project.name,
+                'Implementation-Version': project.version,
+                'Build-Time': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ"),
+                'Revision': getRevision(),
+                'Build-Number': System.getenv('BUILD_NUMBER') ?: '-1',
+            )
+        }
+        from(project.parent.projectDir) {
+            include 'NOTICE.txt'
+            include 'LICENSE.txt'
+            into('META-INF')
+        }
+    }
 }

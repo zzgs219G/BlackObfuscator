@@ -224,7 +224,7 @@ public abstract class Value implements Cloneable {
     /**
      * Value Type
      */
-    public VT vt;
+    final public VT vt;
 
     /**
      * 

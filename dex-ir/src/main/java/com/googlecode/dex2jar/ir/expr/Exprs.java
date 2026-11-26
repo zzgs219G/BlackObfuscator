@@ -15,6 +15,7 @@
  */
 package com.googlecode.dex2jar.ir.expr;
 
+import com.googlecode.d2j.CallSite;
 import com.googlecode.d2j.DexType;
 import com.googlecode.d2j.Method;
 import com.googlecode.d2j.MethodHandle;
@@ -34,15 +35,11 @@ public final class Exprs {
     }
 
     public static Constant nByte(byte i) {
-        Constant constant = new Constant(i);
-        constant.valueType = "B";
-        return constant;
+        return new Constant(i);
     }
 
     public static Constant nChar(char i) {
-        Constant constant = new Constant(i);
-        constant.valueType = "C";
-        return constant;
+        return new Constant(i);
     }
 
     public static Constant nType(String desc) {
@@ -53,27 +50,19 @@ public final class Exprs {
     }
 
     public static Constant nDouble(double i) {
-        Constant constant = new Constant(i);
-        constant.valueType = "D";
-        return constant;
+        return new Constant(i);
     }
 
     public static Constant nFloat(float i) {
-        Constant constant = new Constant(i);
-        constant.valueType = "F";
-        return constant;
+        return new Constant(i);
     }
 
     public static Constant nInt(int i) {
-        Constant constant = new Constant(i);
-        constant.valueType = "I";
-        return constant;
+        return new Constant(i);
     }
 
     public static Constant nLong(long i) {
-        Constant constant = new Constant(i);
-        constant.valueType = "J";
-        return constant;
+        return new Constant(i);
     }
 
     public static Constant nNull() {
@@ -81,17 +70,18 @@ public final class Exprs {
     }
 
     public static Constant nShort(short i) {
-        Constant constant = new Constant(i);
-        constant.valueType = "S";
-        return constant;
-    }
-
-    public static Constant nString(String i) {
-        Constant constant = new Constant(i);
-        constant.valueType = "Ljava/lang/String;";
         return new Constant(i);
     }
 
+    public static Constant nString(String i) {
+        return new Constant(i);
+    }
+    public static Constant nMethodHandle(MethodHandle i) {
+        return new Constant(i);
+    }
+    public static Constant nProto(Proto i) {
+        return new Constant(i);
+    }
     public static BinopExpr nAdd(Value a, Value b, String type) {
         return new BinopExpr(VT.ADD, a, b, type);
     }
@@ -211,8 +201,8 @@ public final class Exprs {
         return new InvokeExpr(VT.INVOKE_VIRTUAL, regs, owner, name, argmentTypes, returnType);
     }
 
-    public static InvokeCustomExpr nInvokeCustom(Value[] regs, String name, Proto proto, MethodHandle handle, Object[] bsmArgs) {
-        return new InvokeCustomExpr(VT.INVOKE_CUSTOM, regs , name, proto, handle,  bsmArgs);
+    public static InvokeCustomExpr nInvokeCustom(Value[] regs, CallSite callSite) {
+        return new InvokeCustomExpr(VT.INVOKE_CUSTOM, regs , callSite);
     }
 
     public static InvokePolymorphicExpr nInvokePolymorphic(Value[] regs, Proto proto, Method method) {

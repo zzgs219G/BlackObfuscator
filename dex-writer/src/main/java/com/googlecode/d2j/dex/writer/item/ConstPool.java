@@ -16,15 +16,24 @@
  */
 package com.googlecode.d2j.dex.writer.item;
 
+import com.googlecode.d2j.CallSite;
+import com.googlecode.d2j.DexConstants;
 import com.googlecode.d2j.DexType;
 import com.googlecode.d2j.Field;
 import com.googlecode.d2j.Method;
+import com.googlecode.d2j.MethodHandle;
+import com.googlecode.d2j.Proto;
 import com.googlecode.d2j.dex.writer.DexWriteException;
+import com.googlecode.d2j.dex.writer.ev.EncodedArray;
+import com.googlecode.d2j.dex.writer.ev.EncodedValue;
 
 import java.util.*;
 
 public class ConstPool {
-    public List<EncodedArrayItem> encodedArrayItems = new ArrayList<>();
+    public int dexVersion = DexConstants.DEX_035;
+
+    public Map<CallSiteIdItem, CallSiteIdItem> callSiteIdItems = new TreeMap<>();
+    public Map<EncodedArray, EncodedArray> encodedArrayItems = new TreeMap<>();
     public Map<AnnotationSetRefListItem, AnnotationSetRefListItem> annotationSetRefListItems = new HashMap<>();
     public List<CodeItem> codeItems = new ArrayList<>();
     public List<ClassDataItem> classDataItems = new ArrayList<>();
@@ -40,18 +49,43 @@ public class ConstPool {
     public Map<TypeListItem, TypeListItem> typeLists = new TreeMap<>();
     public Map<String, TypeIdItem> types = new TreeMap<>();
     public Map<TypeIdItem, ClassDefItem> classDefs = new HashMap<>();
+    public Map<MethodHandleItem, MethodHandleItem> methodHandlers = new TreeMap<>();
 
     public Object wrapEncodedItem(Object value) {
         if (value instanceof DexType) {
-            value = uniqType(((DexType) value).desc);
+            return uniqType(((DexType) value).desc);
         } else if (value instanceof Field) {
-            value = uniqField((Field) value);
+            return uniqField((Field) value);
         } else if (value instanceof String) {
-            value = uniqString((String) value);
+            return uniqString((String) value);
         } else if (value instanceof Method) {
-            value = uniqMethod((Method) value);
+            return uniqMethod((Method) value);
+        } else if (value instanceof MethodHandle) {
+            return uniqMethodHandle((MethodHandle) value);
+        } else if (value instanceof Proto) {
+            return uniqProto((Proto) value);
         }
         return value;
+    }
+
+    private MethodHandleItem uniqMethodHandle(MethodHandle value) {
+        MethodHandleItem mh = new MethodHandleItem();
+        mh.type = value.getType();
+        Field field = value.getField();
+        Method method = value.getMethod();
+        if (field != null) {
+            mh.field = uniqField(field);
+        } else if (method != null) {
+            mh.method = uniqMethod(method);
+        }
+
+        MethodHandleItem result = methodHandlers.get(mh);
+        if (result == null) {
+            methodHandlers.put(mh, mh);
+            result = mh;
+        }
+
+        return result;
     }
 
     public void clean() {
@@ -100,6 +134,18 @@ public class ConstPool {
 
     public void addDebugInfoItem(DebugInfoItem debugInfoItem) {
         debugInfoItems.add(debugInfoItem);
+    }
+
+    public void dex039() {
+        if (dexVersion < DexConstants.DEX_039) {
+            dexVersion = DexConstants.DEX_039;
+        }
+    }
+
+    public void dex038() {
+        if (dexVersion < DexConstants.DEX_038) {
+            dexVersion = DexConstants.DEX_038;
+        }
     }
 
     static class PE {
@@ -222,8 +268,11 @@ public class ConstPool {
         return key;
     }
 
-    private ProtoIdItem uniqProto(Method method) {
+    public ProtoIdItem uniqProto(Proto method) {
         return uniqProto(method.getParameterTypes(), method.getReturnType());
+    }
+    private ProtoIdItem uniqProto(Method method) {
+        return uniqProto(method.getProto());
     }
 
     public ProtoIdItem uniqProto(String[] types, String retDesc) {
@@ -307,11 +356,31 @@ public class ConstPool {
         return dataItem;
     }
 
-    // TODO change EncodedArrayItem to uniq
-    public EncodedArrayItem putEnCodedArrayItem() {
-        EncodedArrayItem arrayItem = new EncodedArrayItem();
-        encodedArrayItems.add(arrayItem);
-        return arrayItem;
+    public CallSiteIdItem uniqCallSite(CallSite callSite) {
+        EncodedArray e = new EncodedArray();
+        e.values.add(new EncodedValue(EncodedValue.VALUE_METHOD_HANDLE, uniqMethodHandle(callSite.getBootstrapMethodHandler())));
+        e.values.add(new EncodedValue(EncodedValue.VALUE_STRING, uniqString(callSite.getMethodName())));
+        e.values.add(new EncodedValue(EncodedValue.VALUE_METHOD_TYPE, uniqProto(callSite.getMethodProto())));
+        for (Object arg : callSite.getExtraArguments()) {
+            e.values.add(EncodedValue.wrap(wrapEncodedItem(arg)));
+        }
+        CallSiteIdItem k = new CallSiteIdItem(callSite.getName(), uniqEncodedArrayItem(e));
+
+        CallSiteIdItem v = callSiteIdItems.get(k);
+        if (v == null) {
+            v = k;
+            callSiteIdItems.put(v, v);
+        }
+        return v;
+    }
+
+    public EncodedArray uniqEncodedArrayItem(EncodedArray k) {
+        EncodedArray v = encodedArrayItems.get(k);
+        if (v == null) {
+            v = k;
+            encodedArrayItems.put(v, v);
+        }
+        return v;
     }
 
     public AnnotationSetItem uniqAnnotationSetItem(AnnotationSetItem key) {
