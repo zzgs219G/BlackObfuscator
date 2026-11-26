@@ -439,11 +439,33 @@ public class IR2JConverter implements Opcodes {
             case LOOKUP_SWITCH: {
                 LookupSwitchStmt lss = (LookupSwitchStmt) st;
                 accept(lss.op, asm);
-                Label targets[] = new Label[lss.targets.length];
-                for (int i = 0; i < targets.length; i++) {
+                int n = lss.targets.length;
+                Label targets[] = new Label[n];
+                for (int i = 0; i < n; i++) {
                     targets[i] = (Label) lss.targets[i].tag;
                 }
-                asm.visitLookupSwitchInsn((Label) lss.defaultTarget.tag, lss.lookupValues, targets);
+                int[] keys = lss.lookupValues;
+                // ⚠️ 2026-11-27 修：JVM 规范要求 lookupswitch 的 match 键严格升序，
+                //   否则 HotSpot 加载类时直接抛
+                //     java.lang.VerifyError: Bad lookupswitch instruction
+                //   DEX 的 sparse-switch 天然有序，所以上游这里从不排序；但混淆器
+                //   （FlowObfuscator / IfObfuscator）是用随机字符串的 hashCode ^ 常量
+                //   拼出键的，插入顺序完全随机。
+                //   注意 d8 / dx / ASM verifier 都不校验这一点，只有真正在 JVM 上
+                //   执行类时才会炸 —— 必须在这里兜底。
+                for (int i = 1; i < n; i++) {
+                    int key = keys[i];
+                    Label target = targets[i];
+                    int j = i - 1;
+                    while (j >= 0 && keys[j] > key) {
+                        keys[j + 1] = keys[j];
+                        targets[j + 1] = targets[j];
+                        j--;
+                    }
+                    keys[j + 1] = key;
+                    targets[j + 1] = target;
+                }
+                asm.visitLookupSwitchInsn((Label) lss.defaultTarget.tag, keys, targets);
             }
                 break;
             case TABLE_SWITCH: {
