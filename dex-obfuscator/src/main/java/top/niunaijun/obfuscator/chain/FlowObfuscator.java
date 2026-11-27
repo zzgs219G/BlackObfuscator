@@ -174,6 +174,9 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 		newStmts.add(whileBlock.getLabelStmt());
 
 		newStmts.add(Stmts.nAssign(obfStrHash, hashInvoke(obfStr)));
+		// 状态值保持纯粹：必须能确定地命中 dispatcher 的某个 case。
+		// 不透明性由独立的 OpaquePredicatePass 负责（它在本 Pass 之后运行），
+		// 那里才是攻击者要猜「哪条边是活的」的地方。
 		newStmts.add(Stmts.nAssign(obfIndex, Exprs.nXor(obfIndexFinal, obfStrHash, "I")));
 
 		Map<Integer, LabelStmt> switchBlock = new LinkedHashMap<>();

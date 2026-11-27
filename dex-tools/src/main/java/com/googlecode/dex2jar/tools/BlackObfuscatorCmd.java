@@ -58,6 +58,15 @@ public class BlackObfuscatorCmd extends BaseCmd {
     private boolean keep;
 
     /**
+     * 启用的混淆模块，逗号分隔。默认全部启用。
+     * 可用模块： flow, if, sub, instruction-substitution, opaque-predicate
+     * 例： -m opaque-predicate           只跑不透明谓词
+     *      -m flow,opaque-predicate      只要平坦化 + 不透明谓词
+     */
+    @Opt(opt = "m", longOpt = "modules", description = "Enabled obfuscation modules (comma separated)")
+    private String modules;
+
+    /**
      * whileList
      */
     private final List<String> whileList = new ArrayList<>();
@@ -113,12 +122,17 @@ public class BlackObfuscatorCmd extends BaseCmd {
                 return;
             }
 
+            final java.util.Set<String> enabledModules = parseModules(modules);
             new Dex2jarCmd(new ObfuscatorConfiguration() {
                 @Override
                 public int getObfDepth() {
                     return depth;
                 }
 
+                @Override
+                public java.util.Set<String> getEnabledModules() {
+                    return enabledModules;
+                }
             }).doMain("-f", splitDex.getPath(), "-o", tempJar.toString());
             new Jar2Dex().doMain("-f", "-o", obfDex.toString(), tempJar.toString());
             DexLib2Utils.mergerAndCoverDexFile(input.toFile(), obfDex, output.toFile());
@@ -134,6 +148,21 @@ public class BlackObfuscatorCmd extends BaseCmd {
                 System.out.println("keep: dex=" + obfDex);
             }
         }
+    }
+
+    /** 解析 -m 参数；null 或空表示全部启用。 */
+    private static java.util.Set<String> parseModules(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return null;
+        }
+        java.util.Set<String> set = new java.util.LinkedHashSet<>();
+        for (String part : raw.split(",")) {
+            String m = part.trim().toLowerCase();
+            if (!m.isEmpty()) {
+                set.add(m);
+            }
+        }
+        return set;
     }
 
     @Override
