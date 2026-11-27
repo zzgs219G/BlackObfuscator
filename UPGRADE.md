@@ -1,104 +1,196 @@
-# 升级记录（2026-11-27）
+# BlackObfuscator 升级与评估记录
 
-本 fork 从原版（2025-05）升级到现代工具链。
+> 记录时间：2026-11-27
+> 分支：`jar2dex-2.2`
 
-## 一、升级内容
+---
 
-| 依赖 | 升级前 | 升级后 |
-|---|---|---|
-| Gradle | 6.9.1（2021） | **9.9.2**（2026-11） |
-| Java | 8 | **17** |
-| dex2jar | 2.1-SNAPSHOT（2012 代码底子） | **2.4**（2026-10） |
-| ASM | 内嵌 `org.objectweb.asm2`（2012 fork） | **org.ow2.asm 9.11.1**（官方） |
-| guava | 18.0（2014） | **33.8.0-jre** |
-| antlr4-runtime | 4.5 | **4.13.2** |
-| junit | 4.10 / 4.11 / 4.12 | **5.11.4** |
-| baksmali | 2.0.6 | **2.5.2** |
-| commons-compress | 1.4.1 | **1.28.0** |
+## 一、结论先行
 
-### 关键收益：支持 DEX_039 / DEX_040
+这次工作的成果和局限，先讲清楚：
 
-原版只认 `DEX_035 ~ DEX_038`，遇到 Android 9+ 用 R8 编译的包（DEX_039）
-直接抛 `not support version`。现在上限放宽到 `DEX_040`，且改为
-「不认识的版本继续尝试」而非直接抛异常。
+### 做成了什么
 
-## 二、改了什么
-
-### 1. 构建脚本（Gradle 9 语法）
-
-| 老写法（Gradle 6 及以前） | 新写法（Gradle 9） |
+| 项 | 状态 |
 |---|---|
-| `apply plugin: 'maven'` | 已移除，不再需要发布到本地 maven |
-| `apply plugin: 'idea'/'eclipse'` | 已移除（IDE 自己负责） |
-| `compile project(...)` | `api project(...)` / `implementation project(...)` |
-| `compile 'g:a:v'` | `implementation 'g:a:v'` |
-| `sourceCompatibility = 1.8` | `JavaVersion.VERSION_17` |
-| `task xxx(type: JavaExec)` | `tasks.register('xxx', JavaExec)` |
-| `mainClassName = "..."` | `application { mainClass = "..." }` |
-| `artifacts.archives distZip` | 已移除（用 `distZip` 任务直接跑） |
+| 工具链现代化（Gradle 9 / JDK 17 / dex2jar 2.4 / ASM 9） | ✅ 完成 |
+| 修掉 8 个 bug（其中 2 个会导致静默产错包） | ✅ 完成 |
+| 混淆模块化，可独立开关、自由组合 | ✅ 完成 |
+| 真实 App 全量混淆（707 类），dx/d8 均可回转 | ✅ 完成 |
+| 真机安装运行验证 | ✅ 通过 |
 
-⚠️ **`api` 与 `implementation` 的区别很重要**：`compile` 会传递依赖，
-`implementation` 不会。原代码里 `d2j-smali` 依赖 `dex-reader` 却直接用
-`dex-reader-api` 的类，改成 `implementation` 后会编译失败。所以需要传递的
-依赖一律用 `api`，并启用 `java-library` 插件。
+### 没做成什么
 
-### 2. dex2jar 2.1 → 2.4（上游覆盖）
+**控制流混淆的强度没有实质提升。**
 
-覆盖了这些模块（本 fork 没改过）：
-`dex-reader` / `dex-reader-api` / `dex-writer` / `dex-ir` / `dex-translator` /
-`d2j-base-cmd` / `d2j-jasmin` / `d2j-smali`
+自建 5 种反平坦化攻击的实测结果（`MainActivity`，87 个块 / 79 条边）：
 
-**保留了本 fork 的三处注入**（重新打补丁）：
-- `dex-translator/.../IR2JConverter.java` —— `obf` 字段 + `reBuildInstructions` 里调 `IRObfuscator`
-- `dex-translator/.../Dex2jar.java` —— `obf()` builder，传给 `IR2JConverter`
-- `dex-tools/.../Dex2jarCmd.java` —— `Dex2jarCmd(ObfuscatorConfiguration)` 构造器
+| 攻击 | 还原率 |
+|---|---|
+| A1 hash 原像 | 0.0% |
+| A2 groupBy 合并 | 78.5% |
+| A3 MBA 规范化 | 121.5% |
+| A4 谓词剪枝 | 163.3% |
+| **A5 出口签名连边** | **100.0%** |
 
-### 3. asm2 → 官方 ASM
+**A5 是最致命的一条，也是理解整个问题的关键。**
 
-上游 v2.4 全面改用 `org.ow2.asm`，不再内嵌 `asm2`。同步改动：
-- `d2j-jasmin/src/main/antlr3/.../Jasmin.g` 的 import
-- `d2j-smali/src/main/antlr4/.../Smali.g4` 的 import + `method_handler` 规则
+---
 
-### 4. 修 `Value.vt` 变 final
+## 二、为什么强度上不去（核心问题）
 
-dex2jar 2.4 把 `Value.vt` 改成 `final`，`SubObfuscator.java` 里两处
-`v2.vt = Value.VT.SUB/ADD` 编译不过。改为构造新表达式替换整个 `e2.op2`：
+### 泄漏点在「块尾的明文 key」，不在「state 怎么算」
+
+原 `FlowObfuscator` 的状态转移设计：
 
 ```java
-// 旧
-v2.vt = Value.VT.SUB;
-v2.setOp2(Exprs.nInt(-increment));
+// 每个块的出口
+obfStr = "Iۛ᩷ܳ";                    // ← 明文 key，就躺在字节码里
+goto dispatcher;
 
-// 新 —— 注意必须补 valueType，否则 IR2JConverter NPE（见第六节 bug 2）
-Constant c = Exprs.nInt(-increment);
-c.valueType = "I";
-e2.op2 = Exprs.nSub(v2.getOp1(), c, "I");
+// dispatcher
+state = obfStr.hashCode() ^ obfIndexI;
+switch (state) { case <某值>: goto 某块; }
 ```
 
-### 5. 精简 `dex-tools`
+攻击者**完全不需要计算 state**：
 
-删掉 30 个用不到的 CLI 工具，只保留混淆链路需要的：
-`BlackObfuscatorCmd` / `Dex2jarCmd` / `Jar2Dex` / `BaksmaliBaseDexExceptionHandler`
+```python
+for block in blocks:
+    next_key = block.exit_string      # 明文，直接读
+    edges.append((block, key_to_block[next_key]))
+```
 
-**原因**：`SunJarSignImpl` 用了 `sun.security.pkcs/x509`（JDK 17+ 已封装为不可访问），
-而那些 signapk / weaver 工具与本项目无关。
+因为「key 集合」是封闭的 —— 每个 key 既作为某块的出口出现，又作为某块的入口。
+所以只要收集方法内所有字符串常量，就能把 `块 → 后继块` 的整张图连出来。
 
-### 6. `Main.java` 改为真 CLI
+这就是 A5 恒为 100% 的原因。
 
-原来硬编码作者本机路径 `/Users/milk/Documents/classes.dex`，现在透传命令行参数。
+### 这解释了为什么前几轮全部无效
 
-## 三、怎么用
+| 轮次 | 加的东西 | 改动位置 | 对 A5 的影响 |
+|---|---|---|---|
+| v1 | `availableProcessors() > 0` | state 的计算 | 无 |
+| v2 | 三条数论恒等式 | state 的计算 | 无 |
+| v3 | 12 种谓词随机化 | state 的计算 | 无 |
+| v4 | `state + mask*SPACE`，case 表 4 份副本 | case 表的编码 | 无（`groupBy` 可合并） |
+| v5 | MBA 算术改写 | state 的计算 | 无 |
+
+**全都在加固「怎么算 state」，而攻击者走的是「块尾那个字符串」。**
+
+这也是为什么每次改动都能被独立评审指出「本质没变」——因为它确实没变。
+
+---
+
+## 三、对照商业混淆器（真实差距）
+
+对比样本：某商业混淆器产出的 `MainActivity.java`（jadx 反编译，2075 行）。
+
+### 它的状态转移
+
+```java
+case 1748858:
+    if (۟ۥۣ.ۣ۟۟ۨۡ < 0) {
+        i = (ۣ۟ۡۨۦ.ۣۨۦ۠ + ۣ۟ۧۨ.ۦ۠ۢ۟) ^ 1750767;
+        break;
+    } else {
+        i = ۣۢۤۢ.ۣ۟ۡۦۨ("۠ۨ");
+        break;
+    }
+```
+
+- 状态值来自**跨类静态字段运算**（`ۣ۟ۡۨۦ.ۣۨۦ۠` + `ۣ۟ۧۨ.ۦ۠ۢ۟`）
+- **没有明文 key 字符串**
+- case 值域是 `56297 ~ 1755615` 的小整数
+
+攻击者要确定这条边，必须做**全程序数据流分析**：找到那些字段在哪个类赋值、
+赋值顺序如何。
+
+### 它的字符串保护
+
+```java
+file2 = new File(str, (String) ۣ۟ۤۡ.n(27202, (Object) null,
+        new Object[]{(short[]) ۣ۟ۤۡ.n(97586),
+                     35,                                    // 在数组中的偏移
+                     Integer.valueOf(۟ۥۣ.ۣ۟۟ۨۡ ^ (-19)),   // 异或密钥（也是字段）
+                     498}));                                // 长度
+```
+
+`"index.html"` 这个字符串在字节码里**完全不存在**：
+- 只剩数组索引 `97586`、偏移 `35`、长度 `498`
+- 异或密钥 `۟ۥۣ.ۣ۟۟ۨۡ ^ (-19)` 本身也依赖另一个字段
+
+### 它的模块清单 vs 本项目的
+
+| 商业混淆器模块 | 本项目 | 说明 |
+|---|---|---|
+| **字符串加密** | ❌ **缺** | 最关键，见下节 |
+| **加密资源 ID** | ❌ 缺 | |
+| **常量/数字混淆** | ❌ 缺 | 部分被 MBA 覆盖 |
+| **反射保护** | ❌ 缺 | |
+| **去除调试信息** | ❌ 缺 | |
+| **dex 优化** | ❌ 缺 | |
+| 控制流扁平化 | ✅ `flow` | |
+| 条件反折 | ✅ `if` | |
+| 指令替换 | ✅ `sub` / `mba` / `instruction-substitution` | |
+| 不透明谓词 | ✅ `opaque-predicate` | |
+
+**本项目 6 个模块里，5 个都在改「代码怎么写」，没有一个在保护「数据是什么」。**
+
+而攻击者真正要的（域名、API 路径、签名比对值）**全是数据**。
+把控制流搞得再复杂，`strings classes.dex | grep http` 依然直接命中。
+
+### 一个侧面证据
+
+jadx 反编译这两个版本的难度：
+
+| | 商业版 | 本项目 |
+|---|---|---|
+| `JADX WARN` 数量 | **59 个** | 0 |
+| "Code decompiled incorrectly" | **9 处** | 0 |
+| 反编译结果 | 部分方法只剩 dump | 干净可读 |
+
+---
+
+## 四、模块清单与用法
+
+### 当前模块
+
+| 模块 | 层级 | 作用 |
+|---|---|---|
+| `flow` | chain | 控制流平坦化（while + lookupswitch 状态机） |
+| `if` | chain | 条件反折 |
+| `sub` | chain | 算术改写（`a+b` → `a-(-b)`） |
+| `instruction-substitution` | Pass | 指令替换 |
+| `opaque-predicate` | Pass | 数论恒等式谓词（12 种，每块随机） |
+| `mba` | Pass | MBA 算术混淆（`a+b` → `(a^b)+2*(a&b)` 等） |
+
+### 两层架构
+
+```
+ObfuscatorChain  —— 逐【语句】回调，适合改写局部表达式
+ObfuscationPass  —— 对整个【方法】做一次整体重写，方法级顺序明确
+```
+
+执行顺序：
+
+```
+阶段一（chain）：flow → if → sub
+阶段二（Pass）：instruction-substitution → opaque-predicate → mba
+```
+
+分两层的原因：方法级变换要求「我先、你后」的明确顺序（不透明谓词要包住
+平坦化产生的块出口），而逐语句回调天然表达不了。
 
 ### 编译
 
 ```bash
-./gradlew build -x test          # 产出各模块 jar
+./gradlew build -x test
 ```
 
 ### 运行
 
 ```bash
-# classpath = 本工程所有 jar + 依赖
 CP=$(find . -name "*.jar" -path "*libs*" | tr '\n' ':')
 CP="$CP$(find ~/.gradle/caches -name 'guava-33.8.0-jre.jar' \
   -o -name 'asm-9.11.1.jar' -o -name 'asm-tree-9.11.1.jar' \
@@ -107,100 +199,122 @@ CP="$CP$(find ~/.gradle/caches -name 'guava-33.8.0-jre.jar' \
   -o -name 'antlr-runtime-3.5.3.jar' 2>/dev/null | tr '\n' ':')"
 
 java -cp "$CP" com.googlecode.dex2jar.tools.BlackObfuscatorCmd \
-  -d 2 -i classes.dex -o out.dex -p com.example x
+  -d 1 -l 3 -i classes.dex -o out.dex -p com.example -m flow,opaque-predicate,mba x
 ```
 
-> ⚠️ 末尾那个 `x` 是**必须的占位参数**：`BlackObfuscatorCmd` 里有一句
-> `if (remainingArgs.length == 0) { usage(); return; }`，不给位置参数就只打
-> usage 不干活。
+### 参数
 
-> `-p` 是**白名单**（只混淆这个包），不是黑名单；`splitDex` 的 `whiteList`
-> 为空会直接返回 0、什么都不做。想排除某个包用 `-a` 传 allowList 文件。
+| 参数 | 含义 |
+|---|---|
+| `-d, --depth` | chain 重复次数 |
+| `-l, --opaque-layers` | 不透明谓词嵌套层数（1~4，默认 2） |
+| `-m, --modules` | 启用的模块，逗号分隔；不给则全开 |
+| `-p, --package` | **白名单**（只混淆这个包） |
+| `-a, --allow` | allowList 文件路径 |
+| `-k, --keep` | 保留中间产物（排错必用） |
 
-排错时加 `-k`（`--keep`）保留中间产物：
+> ⚠️ 末尾必须给一个位置参数（如 `x`）：`BlackObfuscatorCmd` 里有
+> `if (remainingArgs.length == 0) { usage(); return; }`。
+
+> `-p` 是**白名单**，不是黑名单。`splitDex` 的 `whiteList` 为空会直接返回 0。
+
+### 模块组合示例
 
 ```bash
-java -cp "$CP" com.googlecode.dex2jar.tools.BlackObfuscatorCmd \
-  -d 2 -i classes.dex -o out.dex -p com.example -k x
-# keep: split=/tmp/xxxsplit.dex    ← 从原 dex 切出来的待混淆部分
-# keep: jar=/tmp/xxxobf.jar        ← 混淆后的 class，可用 javap 检查
-# keep: dex=/tmp/xxxobf.dex        ← 混淆后的片段 dex，会被合回 out.dex
+-m flow                        # 只平坦化
+-m opaque-predicate            # 只谓词
+-m flow,opaque-predicate,mba   # 组合
+（不给 -m = 全开）
 ```
 
-`obf.jar` 是排查主要抓手 —— 用 `javap -p -c` 看方法体是
-`throw new RuntimeException("d2j fail translate: ...")` 还是真的被平坦化了。
+---
 
-## 四、实测结果（2026-11-27）
+## 五、实测数据
 
-用 `JMComic3v2.1.14` 的 classes.dex 测（1,018,520 B，DEX_035）：
+### 真机 APK（JMComic 2.1.14，classes.dex 1,211,596 B / 707 类）
+
+全模块 + `-l 3`：
 
 | 项 | 结果 |
 |---|---|
-| 耗时 | **1.5 秒** |
-| 产物 | `out.dex` 2,347,480 B |
-| 体积变化 | **2.30 倍** |
-| 转译失败方法 | **0** |
-| ASM verifier 失败 | **0** |
-| lookupswitch 乱序 | **0**（71 个全部升序） |
-| d8 回转 dex | ✅ 0 error（1,057,932 B） |
-| dex2jar 反解 → d8 | ✅ 0 error（1,040,920 B） |
-| 语义回归（JVM 实跑） | ✅ 7 项输出逐字一致 |
+| 耗时 | 1.5 秒 |
+| 产物 | 1,255,296 B |
+| 体积变化 | **1.036×** |
+| dex2jar 错误 | 0 |
+| ASM verifier 失败 | 0 |
+| lookupswitch 乱序 | 0（46 个全部升序） |
+| d8 回转 | ✅ 0 error |
+| 真机安装运行 | ✅ 通过（漫画正文、翻页、章节、评论、收藏正常） |
 
-**体积膨胀 2.3× 是平坦化的固有代价** —— 每个基本块要多 3~4 条分发指令
-（更新状态码 + goto 回 dispatcher + lookup-switch）。接入流水线前要评估：
-一个 69MB 的包全量混淆可能涨到 160MB+。
+### 语义回归
 
-### 验证手段
+`Sem` 测试类（覆盖槽位复用 / long / double / 嵌套循环 / try-catch-finally /
+switch 状态机），6 种模块组合 × 4 种谓词层数，全部 7 项输出逐字一致。
 
-光看「命令没报错」不够 —— `BlackObfuscatorCmd` 会把翻译失败的方法
-静默替换成 `throw new RuntimeException("d2j fail translate: ...")`，
-产物 dex 依然是「合法」的，装到机器上才炸。建议**四层**验证：
+### 反平坦化评估
 
-1. **ASM verifier**（最精确，直接给出指令序号）
-   `Analyzer(new BasicVerifier()).analyze(owner, methodNode)`
-   报错形如 `Expected J, but found .`，`.` = `UNINITIALIZED_VALUE`
-2. **d8 回转**：`java -Xmx3g -cp d8.jar com.android.tools.r8.D8 --release --output out full.dex`
-3. **往返**：`full.dex` → `Dex2jarCmd` → `d8`，确认能二次转回
-4. **在真 JVM 上跑**（最容易被忽略、但唯一能发现运行时错误的一层）
+```bash
+java -cp "$ASM_CP:/path/to/vcls" DeobfHarness out.dex MainActivity
+```
 
-第 4 层的重要性见下面这个真实案例：混淆产物在 1/2/3 全过的情况下，
-JVM 加载时直接 `VerifyError: Bad lookupswitch instruction`。原因见第七节 bug 7。
+```
+真实块数 87 / CFG 边 79
+A1 hash 原像还原      0 边    0.0%
+A2 groupBy 合并       62 边   78.5%
+A3 MBA 规范化         96 条  121.5%
+A4 谓词剪枝          129 条  163.3%
+A5 出口签名连边       79 边  100.0%
+```
 
-## 五、已知边界
+---
+
+## 六、已知边界（重要）
 
 | 项 | 说明 |
 |---|---|
-| try-catch 方法不混淆 | `FlowObfuscator` 遇到 `ir.traps.size() > 0` 直接原样返回 |
-| `<init>` 不混淆 | 同上，避免构造器语义被破坏 |
-| 只处理指定包 | 靠 `-p` / `-a` 过滤，三方库建议排除（README 原文警告） |
-| 强度中等 | 状态码是「字符串 hash ^ 随机 index」，块 key 在 dex 里是明文字符串常量，反编译后需手工重建映射 —— 能挡「随手看」，挡不住「愿意花时间的人」 |
-| 与 anti-diff 冲突 | 平坦化后 anti-diff 的 E 变换（条件反折）失去意义 |
+| **A5 攻击 100% 可还原** | 块尾明文 key 是根本泄漏点，不解决这条，其余加固都无意义 |
+| **try-catch 方法不混淆** | `FlowObfuscator` 遇 `ir.traps.size() > 0` 整方法跳过。`p`/`onCreate`/`q`/`onActivityResult` 均在此列（恰好是最大的几个方法） |
+| `<init>` 不混淆 | 避免构造器语义被破坏 |
+| 字符串全明文 | `https://18comic.vip/`、`server.html` 等直接 `strings` 可读 |
+| 类名/方法名不混淆 | 本工具不做，需在 dex 化之前用 R8/ProGuard |
+| MBA 只到线性 | 三条恒等式是 degree-1，可用探针求值向量（Eyrolles-Goubin-Videau, SPRO 2016）多项式时间反解 |
+| 与 anti-diff 冲突 | 平坦化后 anti-diff 的 E 变换失去意义 |
 
-## 六、修掉的 7 个 bug
+### 尝试过但失败的方案
 
-前 6 个的**现象完全一样** —— `dx`/`d8` 转不回 dex：
+**放开 trap 方法平坦化**：立刻复现
+```
+Uncaught translation error: SimException: local 0002: invalid
+```
+原因：trap 的 handler 在 loop head 处的类型合并退化为 `UNINITIALIZED_VALUE`。
+已回退。
+
+**固定 case 基址 `i*COPIES*SPACE`**：能保证副本区段不重叠，但运行时
+`state` 由 `key.hashCode()` 决定，固定基址会让 case 表与 state 对不上，
+全部走 `default` 死循环。已回退。
+
+---
+
+## 七、修掉的 8 个 bug
+
+前 6 个现象完全一样 —— `dx`/`d8` 转不回 dex：
 
 ```
 dx:  SimException: local 0007: invalid
-d8:  NegativeArraySizeException: -384128459
+d8:  NegativeArraySizeException
 dex2jar: 方法被替换成 throw new RuntimeException("d2j fail translate: ...")
 ```
 
-但根因各不相同，逐个靠「改一版、跑一遍」看不出方向。真正定位靠
-**ASM verifier 给出指令序号**（见上一节的验证手段）。
-
-第 7 个更隐蔽：前 6 个修复后所有静态验证全过，它却在 JVM 加载时才炸。
+但根因各不相同。真正定位靠 **ASM verifier 给出指令序号**（见第八节）。
 
 ### 1. `LBlock` 用了 `org.objectweb.asm2.Label`
 
-fork 内嵌的 `asm2` 与官方 ASM 9 的 `Label` 不是同一个类，类型转换直接
-`ClassCastException`。升级到官方 ASM 后统一改用 `org.objectweb.asm.Label`。
+fork 内嵌的 `asm2` 与官方 ASM 的 `Label` 不是同一个类，直接 `ClassCastException`。
 
-### 2. `SubObfuscator` 里 `Exprs.nInt()` 没补 `valueType`
+### 2. `Exprs.nInt()` 创建的 Constant 没补 `valueType`
 
-`Constant` 的构造器**不设置** `valueType` —— dex2jar 靠 `TypeTransformer`
-在上游正常流程里统一补（`TypeTransformer.java:94`）。混淆器是**在 IR 转
-code 之前**插新表达式，那些常量没经过 transformer，`valueType` 为 null：
+dex2jar 靠 `TypeTransformer` 在上游流程里统一补。但混淆器是在 IR 转 code
+**之前**插新表达式，那些常量没经过 transformer：
 
 ```java
 // IR2JConverter:1174
@@ -208,116 +322,203 @@ String t = constant.valueType;
 switch (t.charAt(0))   // ← NPE
 ```
 
-NPE 被 `Dex2Asm` 捕获后整个方法替换成 throw。修法是显式赋值：
-`c.valueType = "I"`。
+NPE 被 `Dex2Asm` 捕获后整个方法替换成 throw。
 
 ### 3. `FlowObfuscator` 重复 `addAll(newBlock.getStmts())`
 
-外层已经加过一遍，内层 `if (nextKey != "")` 分支又加一遍 —— 每个带后继的
-基本块，指令在字节码里出现两遍。体积上看不出来（`deadCode` transformer
-会去重），但带副作用的指令（方法调用、字段写入）会被**执行两次**，改变
-程序行为。
+外层已加过，内层 `if (nextKey != "")` 又加一遍。体积上看不出来
+（`deadCode` transformer 会去重），但带副作用的指令会**执行两次**。
 
 ### 4. `newLocal` 的编号与已有 Local 冲突
 
-原实现：
+原实现 `localIndex = ir.locals.size() * 2` 后 `++`。但 `locals.size()`
+≠ 最大 `_ls_index`，且三个 chain 各持一个实例、各自重置。
 
-```java
-localIndex = ir.locals.size() * 2;          // reBuild 时重置
-Local local = Exprs.nLocal(++localIndex, name);
-```
+### 5. `newLocal` 没算类型宽度（隐蔽）
 
-两个问题：`locals.size()` ≠ 最大 `_ls_index`；且 `Flow`/`Sub`/`If` 三个
-chain 各持一个实例、各自重置 → 分到同一批编号。改成扫当前最大值。
-
-### 5. `newLocal` 没算类型宽度（**这是最隐蔽的一个**）
-
-`long` / `double` 在 JVM 里占 **2 个槽位**。只按 `max + 1` 分配，一个新
-`int` 会正好落在某个 `long` 的第二个槽上，把那个 `long` 直接拆坏：
+`long`/`double` 占 **2 个槽位**。只按 `max + 1` 分配，新 `int` 会落在某个
+`long` 的第二个槽上：
 
 ```
-LLOAD 8
-PUTFIELD MainActivity.E:J
+LLOAD 8 / PUTFIELD MainActivity.E:J
 verifier: Expected J, but found .
 ```
 
-dex2jar 自己的 `Ir2JRegAssignTransformer` 是按宽度着色的
-（`excludeColor.get(i) && excludeColor.get(i + 1)`），这里必须保持一致：
+### 6. 槽位复用在 loop head 处的类型合并
 
-```java
-int end = l._ls_index + slotWidth(l.valueType);   // J/D 算 2
-```
+平坦化把所有原基本块塞进同一个 `while`，loop head 成了全部路径的汇合点。
+只要某个 slot 在部分路径上没被写过，合并结果就退化成 `UNINITIALIZED_VALUE`。
 
-### 6. 槽位复用在 loop head 处的类型合并（**这才是主因**）
+原版那段「给 Local 重新编号 + 插 null 初始化」正是为此。**排查时我曾把它
+误判成 bug 删掉**，导致错误在 `local 0005` / `local 0007` 之间反复跳动。
 
-平坦化把所有原基本块塞进同一个 `while`，**loop head 成了全部路径的汇合点**。
-verifier 在该点对每个 slot 做类型合并 —— 只要某个 slot 在**部分路径上没被
-写过**，合并结果就退化成 `UNINITIALIZED_VALUE`。
+### 7. `lookupswitch` 的 match 键没排序（唯一到运行时才暴露的）
 
-原版 `FlowObfuscator` 那段看起来可疑的代码正是为此：
-
-```java
-local1._ls_index = newLocal("new_local", op2.valueType)._ls_index;
-newStmts.add(Stmts.nAssign(local1, getNullValue(op2)));
-```
-
-- 前半句：给每个被赋值的局部变量分配**独占**槽位 —— 原 dex 里同一个寄存器
-  会承载不同类型的不同变量，平坦化后这些变量在 loop head 汇合，类型必然冲突
-- 后半句：在**方法入口（while 之前）** 插一条初始化为 0/null 的赋值 —— 让
-  每个槽位在所有路径上都已初始化，合并结果才有定义
-
-**排查过程中我把这段当成 bug 删掉过**，结果错误从 `local 0005` 变成
-`local 0007`，一直找不到方向。教训：看不懂的「可疑代码」先确认它解决了
-什么问题，再判断是不是 bug。
-
-### 7. `lookupswitch` 的 match 键没排序（**唯一到运行时才暴露的一个**）
-
-现象和上面 6 个完全不同 —— dex 能生成、d8 能回转、verifier 全过，但真正
-在 JVM 上加载类时：
+JVM 规范要求 `lookupswitch` 的 match 键**严格升序**。混淆器按插入顺序造键，
+正负、大小全随机：
 
 ```
 java.lang.VerifyError: Bad lookupswitch instruction
-  Location: com/demo/Sem.main([Ljava/lang/String;)V @142: lookupswitch
 ```
 
-JVM 规范要求 `lookupswitch` 的 match 键**严格升序**，HotSpot 加载时校验。
-而混淆器按插入顺序造键：
-
-```java
-switchBlock.put(newBlock.getKey().hashCode() ^ obfIndexI, ...)
-// key 是随机字符串的 hashCode ^ 常量 → 正负、大小全随机
-```
-
-上游 dex2jar 从不排序也没事，因为 **DEX 的 sparse-switch 编码天然保证键
-升序**（dex 格式里就是有序差值表），来自 dex 的 IR 一定已经有序。混淆器
-是在 IR 层凭空造新 switch，破坏了这个隐含前提。
-
-#### 为什么前 3 层验证全都没发现
+**为什么前几层验证全没发现：**
 
 | 手段 | 结果 | 原因 |
 |---|---|---|
-| d8 回转 dex | ✅ 通过 | DEX 的 sparse-switch 不要求有序 |
-| dx 回转 dex | ✅ 通过 | 同上 |
-| ASM Analyzer | ✅ 通过 | 只校验栈帧/类型，不校验 switch 表 |
-| **真 JVM 加载执行** | ❌ `VerifyError` | HotSpot 才校验 |
+| d8 回转 | ✅ | DEX 的 sparse-switch 不要求有序 |
+| dx 回转 | ✅ | 同上 |
+| ASM Analyzer | ✅ | 只校验栈帧/类型，不校验 switch 表 |
+| **真 JVM 加载** | ❌ `VerifyError` | HotSpot 才校验 |
 
-**这是本项目最重要的一条教训**：中间格式合法（DEX / class 结构）≠
-目标 VM 能接受。混淆这种「改写字节码」的工具，必须让产物在目标运行时上
-真的跑一遍。
+修法：在 `IR2JConverter` 发射 lookupswitch 时做插入排序。
 
-修法是在 `IR2JConverter` 发射 lookupswitch 时做一次插入排序（键与 target
-同步移动）。选这里而不是改 `FlowObfuscator` / `IfObfuscator`，是因为它同时
-覆盖两条链路（`IfObfuscator` 也调 `Stmts.nLookupSwitch`），且对 IR 层无侵入。
+### 8. 副本展开的 case 值碰撞（静默产错包）
 
-## 七、升级过程中踩的坑（给后来者）
+`base + c*SPACE` 在 int 上回绕，两个不同块的 case 值可能撞在一起，
+`switchBlock.put` 静默覆盖 → 某块永不可达 → **行为错误**。
 
-1. **`compile` → `implementation` 会丢依赖传递** —— 必须按需改成 `api`
-   并启用 `java-library` 插件，否则一堆「cannot find symbol」
-2. **`gradle-wrapper.jar` 可能没进仓库** —— 需要单独下载
-   `https://raw.githubusercontent.com/gradle/gradle/v<ver>/gradle/wrapper/gradle-wrapper.jar`
+实测安全条件：两块基址间距必须 ≥ `COPIES*SPACE`（`0x10000000`）。
+现在加了前置探测，有碰撞就整体退化为单份。
+
+---
+
+## 八、验证方法（四层）
+
+光看「命令没报错」不够 —— 翻译失败的方法会被静默替换成
+`throw new RuntimeException("d2j fail translate: ...")`，产物 dex 依然「合法」。
+
+1. **ASM verifier**（最精确，直接给出指令序号）
+   ```java
+   Analyzer<BasicValue> an = new Analyzer<>(new BasicVerifier());
+   an.analyze(owner, methodNode);
+   ```
+   报错形如 `Expected J, but found .`，`.` = `UNINITIALIZED_VALUE`
+
+2. **d8 回转**
+   ```bash
+   java -Xmx3g -cp d8.jar com.android.tools.r8.D8 --release --output out full.dex
+   ```
+
+3. **往返**：`full.dex` → `Dex2jarCmd` → `d8`
+
+4. **真 JVM 加载执行**（唯一能发现运行时错误的一层）
+
+第 4 层的重要性见 bug 7。**中间格式合法（DEX / class 结构）≠ 目标 VM 能接受。**
+
+### 辅助工具
+
+| 工具 | 作用 |
+|---|---|
+| `Verify` | ASM verifier，逐方法校验栈帧 |
+| `SwitchCheck` | 静态扫描所有 lookupswitch 的键顺序 |
+| `DeobfHarness` | 5 种反平坦化攻击，输出还原率 |
+| `Strength` | 统计块出口的「分支守卫」比例 |
+| `Collapse` | 验证 case 副本能否被 `groupBy` 合并 |
+
+---
+
+## 九、升级过程中踩的坑
+
+1. **`compile` → `implementation` 会丢依赖传递** —— 需按需改成 `api`
+   并启用 `java-library` 插件
+2. **`gradle-wrapper.jar` 可能没进仓库** —— 需单独下载
 3. **ANTLR 4.13 对转义更严格** —— `'\"'` 要写成 `'"'`
 4. **`applicationDistribution` 在 Gradle 9 只能在 `distributions` 块里访问**
-5. **`getRevision()` 这类脚本方法在 `subprojects` 块里不可见** —— 要提到前面
-   定义成闭包变量
-6. **覆盖上游文件时要注意行尾符** —— 上游是 CRLF，本地是 LF，`diff` 会显示
-   「全部不同」的假象，用 `diff -wB` 才看得到真实差异
+5. **`getRevision()` 这类脚本方法在 `subprojects` 块里不可见**
+6. **覆盖上游文件时注意行尾符** —— 上游是 CRLF，本地是 LF，
+   `diff` 会显示「全部不同」的假象，用 `diff -wB`
+
+---
+
+## 十、后续方向（如果要继续）
+
+按「能真正改变攻击者成本」排序：
+
+### 1. 字符串加密（最高优先级）
+
+商业版已经验证有效。做法：
+
+```java
+// 现在
+String url = "https://18comic.vip/";
+
+// 改成（字节码里没有明文）
+String url = D.c(KEY_ARRAY, 17, 21, 0x5A3F);
+```
+
+`KEY_ARRAY` 是加密的 `int[]` 常量，`c()` 是解密方法。
+需要新增一个 Pass：收集所有字符串常量 → 加密成数组 → 注入 `<clinit>` →
+生成解密方法 → 替换所有 `LDC`。
+
+**这是唯一能保护业务数据的模块。**
+
+### 2. 去掉块尾明文 key
+
+把状态从「字符串」改成「整数槽位 + 跨类静态字段运算」。
+注意：字段初值必须是**编译期确定的常量**（可加密），不能用 `nanoTime`
+—— 否则 case 表无法反解。
+
+### 3. 去调试信息 + dex 优化
+
+成本极低，收益立竿见影：删行号表、局部变量名、`nop`、冗余 label。
+
+### 4. 反射保护
+
+关键方法调用改成 `Method.invoke`，切断直接调用图。
+
+### 5. 把 dispatcher 移出 dex
+
+```java
+int idx = NativeNext.next(state);   // 表在 .so 里
+switch (idx) { case 0: ... }        // case 退化成 0..n-1
+```
+
+攻击者看不到「state → 块」的映射。代价：需要 NDK 编译 + JNI 调用开销。
+或者走 Dex2C（整个方法体转 native）。
+
+---
+
+## 十一、方法论教训
+
+这是本项目最重要的部分。
+
+### 1. 先写攻击，再写混淆器
+
+前 5 轮全部是「先做变换，再想攻击者会怎么破」，而指标（「抗静态分析 99.2%」）
+没有可复现定义。结果是每一轮都能被指出「本质没变」。
+
+正确做法：先把 `DeobfHarness` 的 5 种攻击写好，任何新 Pass 上线前必须
+证明它能挡住全部 5 种。
+
+### 2. 「攻击者算不出某个值」≠「攻击者无法还原」
+
+v3/v4 的出发点都是「让攻击者算不出 `state`」。但攻击者根本不经过那一步 ——
+他看的是 `case → target` 的映射表，或者块尾的明文 key。
+
+**任何混淆设计都必须先回答：攻击者最短的还原路径是什么？**
+
+### 3. 中间格式合法 ≠ 目标 VM 能接受
+
+`lookupswitch` 键序问题在 d8/dx/ASM 三层全部通过，只有 HotSpot 加载时才炸。
+
+**改写字节码的工具，必须在目标运行时上真跑一遍。**
+
+### 4. 看不懂的「可疑代码」先确认它解决了什么问题
+
+bug 6 里的「给 Local 重新编号」看起来像设计缺陷，实际是让平坦化能被
+verifier 接受的唯一手段。删掉后错误在多个位置之间反复跳动，浪费了大量时间。
+
+### 5. 数据保护 > 代码结构保护
+
+本项目 6 个模块里有 5 个在改「代码怎么写」，但攻击者要的是「数据是什么」。
+`strings classes.dex | grep http` 依然是成本最低、收益最高的攻击。
+
+---
+
+## 附录：产物位置
+
+| 文件 | 说明 |
+|---|---|
+| `/data/data/com.termux/files/usr/tmp/device/dexf/classes.dex` | 混淆后的 dex（1,255,296 B） |
+| `/data/data/com.termux/files/usr/tmp/device/dexf.jar` | 反解出的 jar，可用 javap/jadx 检查 |
+| `/data/data/com.termux/files/usr/tmp/vcls/` | 所有验证/攻击工具的 class |
