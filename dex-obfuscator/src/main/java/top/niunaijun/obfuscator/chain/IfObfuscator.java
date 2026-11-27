@@ -19,6 +19,9 @@ import static com.googlecode.dex2jar.ir.stmt.Stmt.ST.LABEL;
 
 public class IfObfuscator extends BaseObfuscatorChain {
 
+	@Override
+	public boolean canDepth() { return false; }
+
     private static final int MAPPING_INDEX = 0;
     private static final int MAPPING_GOTO = 1;
     private static final int MAPPING_ELSE = 2;

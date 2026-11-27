@@ -17,6 +17,9 @@ import java.util.Random;
 
 public class SubObfuscator extends BaseObfuscatorChain {
 
+	@Override
+	public boolean canDepth() { return false; }
+
     public SubObfuscator(ObfuscatorConfiguration obfuscatorConfiguration) {
         super(obfuscatorConfiguration);
     }

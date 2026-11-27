@@ -45,6 +45,7 @@ public class PassRegistry {
 
     public PassRegistry(ObfuscatorConfiguration config) {
         int depth = config == null ? 1 : config.getObfDepth();
+        int opaqueLayers = config == null ? 2 : config.getOpaqueLayers();
         java.util.Set<String> only = config == null ? null : config.getEnabledModules();
 
         // ---- 阶段一：chain ----
@@ -56,7 +57,7 @@ public class PassRegistry {
         addModule("instruction-substitution", on(only, "instruction-substitution"),
                 () -> methodPasses.add(new InstructionSubstitutionPass(depth)));
         addModule("opaque-predicate", on(only, "opaque-predicate"),
-                () -> methodPasses.add(new OpaquePredicatePass(depth)));
+                () -> methodPasses.add(new OpaquePredicatePass(opaqueLayers)));
     }
 
     /** only 为 null 表示全开；否则只开集合内的。 */

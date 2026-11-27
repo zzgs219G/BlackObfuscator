@@ -19,6 +19,18 @@ public abstract class ObfuscatorConfiguration {
 	}
 
 	/**
+	 * 不透明谓词的嵌套层数（1~3）。
+	 *
+	 * 与 {@link #getObfDepth()} 分开，是因为两者含义不同：
+	 *   getObfDepth()   —— chain 的重复次数（Flow/If/Sub 各自只跑一次，实际影响很小）
+	 *   getOpaqueLayers() —— 谓词的嵌套深度，直接决定抗静态分析强度
+	 * 之前共用一个参数，调深度会意外改变谓词强度，不好控制。
+	 */
+	public int getOpaqueLayers() {
+		return 2;
+	}
+
+	/**
 	 * 启用哪些混淆模块。
 	 *
 	 * 返回 null 表示全部启用（默认行为，兼容旧调用）。

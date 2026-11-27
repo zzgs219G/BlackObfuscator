@@ -67,6 +67,13 @@ public class BlackObfuscatorCmd extends BaseCmd {
     private String modules;
 
     /**
+     * 不透明谓词嵌套层数（1~3，默认 2）。
+     * 层数越多，块出口的候选边越多，静态还原越难，但体积也越大。
+     */
+    @Opt(opt = "l", longOpt = "opaque-layers", description = "Opaque predicate nesting layers (1-3, default 2)")
+    private int opaqueLayers = 2;
+
+    /**
      * whileList
      */
     private final List<String> whileList = new ArrayList<>();
@@ -127,6 +134,11 @@ public class BlackObfuscatorCmd extends BaseCmd {
                 @Override
                 public int getObfDepth() {
                     return depth;
+                }
+
+                @Override
+                public int getOpaqueLayers() {
+                    return opaqueLayers;
                 }
 
                 @Override
