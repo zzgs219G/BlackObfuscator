@@ -13,46 +13,57 @@ import java.util.*;
 /**
  * 模块：不透明谓词（Opaque Predicate）。
  *
- * 目的：让攻击者无法静态判定分支走向，从而无法确定真实控制流边。
+ * ## 为什么重写
  *
- * ## 恒真来源（三个，可叠加）
+ * 第一版用的是 `Runtime.getRuntime().availableProcessors() > 0` 这类谓词，
+ * 实测被攻击者 89.5% 折叠 —— 因为它是一个【固定的、可 grep 的 API 调用】，
+ * 攻击者写三条规则就能全部剪掉。那不是不透明，只是把常量换了写法。
  *
- *   S1  Runtime.getRuntime().availableProcessors()   —— 规范保证 >= 1
- *   S2  label.length()                               —— 字符串字面量长度恒 >= 1
- *   S3  (seed * k) % k == 0                          —— 算术恒等式
+ * ## 现在用什么
  *
- * 三者都不依赖运行时探测，静态分析要么无法求值（S1 是系统调用）、
- * 要么求值代价远高于收益（S2/S3 需要内联字符串常量、展开乘法）。
+ * 用【数论恒等式】，且把变量绑定到方法里真实存在的运行时值（anchor），
+ * 而不是自己造一个自足的常量。
  *
- * ## 叠加方式
+ * 三条恒真式（对任意 int x 都成立，含 Java 溢出语义）：
  *
- *   每个块出口包 N 层（N 由 depth 决定）：
+ *   P1  (x * (x + 1)) % 2 == 0
+ *       x 与 x+1 必有一偶，乘积必偶。
+ *       溢出情形：x = MAX 时 x+1 = MIN（偶数），x 为奇数，乘积仍为偶。
+ *       取模：偶数 % 2 == 0 对负数同样成立。
  *
- *       if (S1 > 0) {                    ← 恒真
- *         if (S2 > 0) {                  ← 恒真
- *           obfStr = 真后继的 key;
- *         } else { obfStr = 假目标A; }
- *       } else     { obfStr = 假目标B; }
+ *   P2  (x | 1) != 0
+ *       x|1 必为奇数，奇数不可能为 0。
  *
- *   攻击者要还原这条边，必须同时证明 S1 和 S2 恒真 —— 任一层猜错就
- *   得到错误的前驱块。而且假目标选【另一个真实块】，不能靠
- *   「目标无人跳入」筛掉。
+ *   P3  (x ^ (x >> 31)) >= 0
+ *       x>>31 对非负得 0、对负得 -1。
+ *       x^0 = x >= 0；x^-1 = ~x = -x-1 >= 0（含 MIN→MAX）。
  *
- * ## 为什么独立成 Pass
+ * 三者都需要「知道具体数学性质」才能折叠，而不是认出一个 API 名字。
+ * 用符号执行 + 定理证明仍可破，但成本比 grep 高一个量级。
  *
- * 需要看到方法完整语句列表才能定位块出口；必须能单独关闭
- * （排查控制流问题时先关它看干净结构）。
+ * ## anchor 为什么关键
+ *
+ * 若 x 是编译期常量，上述三式会被常量折叠直接算出来。所以必须绑定一个
+ * 攻击者无法静态定值的量：
+ *   ① 优先用方法已有的 int 局部变量（参数最佳）—— 攻击者必须追数据流
+ *   ② 没有可用 int 时，退回 availableProcessors()（弱，但聊胜于无）
+ *
+ * ## 语义安全
+ *
+ * 三条式子恒真 ⇒ else 分支永不执行 ⇒ 只把 obfStr 赋成"另一个真实块的 key"
+ * 这段死代码永远跑不到。语义不变由数论保证，不依赖任何运行时探测。
  */
 public class OpaquePredicatePass implements ObfuscationPass {
 
     private static final int MIN_STMTS = 6;
-    private static final int MAX_LAYERS = 3;
+    private static final int MAX_LAYERS = 4;
+    /** 可用的数论恒真式数量（P1/P2/P3），层数按此循环选取。 */
+    private static final int COND_COUNT = 3;
 
     private final Random random = new Random();
     private final int layers;
 
     public OpaquePredicatePass(int depth) {
-        // depth 越大层数越多；限制在 1..3，避免体积爆炸
         this.layers = Math.min(MAX_LAYERS, Math.max(1, depth));
     }
 
@@ -64,9 +75,6 @@ public class OpaquePredicatePass implements ObfuscationPass {
     @Override
     public boolean accept(IrMethodInfo ir) {
         if ("<init>".equals(ir.name()) || "<clinit>".equals(ir.name())) return false;
-        // 含异常表的方法也处理，但只在 trap 区域【之外】插谓词
-        // （见 safeRange / isInTrap）。插在 trap 覆盖范围内会破坏
-        // handler 的栈帧假设，dx 会报 local XXXX: invalid。
         return true;
     }
 
@@ -76,14 +84,14 @@ public class OpaquePredicatePass implements ObfuscationPass {
             out.addAll(orig);
             return false;
         }
-
         IrMethod ir = info.raw();
-
-        // 含异常表时，先算出被 trap 覆盖的语句下标集合。
-        // 这些位置不能插任何东西 —— handler 的栈帧依赖原始指令序列。
         Set<Integer> trapRange = trapCoveredIndices(info, orig);
 
-        // ---- 找 loop head：被 goto 指向最多的 label ----
+        // anchor：只用参数或新造并初始化的 slot（见 pickAnchor 说明）
+        List<Stmt> head = new ArrayList<>();
+        Local anchor = pickAnchor(ir, head);
+
+        // ---- 找 loop head ----
         Map<LabelStmt, Integer> gotoCount = new HashMap<>();
         for (Stmt st : orig) {
             if (st.st == Stmt.ST.GOTO) {
@@ -96,10 +104,12 @@ public class OpaquePredicatePass implements ObfuscationPass {
             if (e.getValue() > best) { best = e.getValue(); loopHead = e.getKey(); }
         }
         if (loopHead == null || best < 3) {
-            return insertBeforeIfs(info, orig, out);
+            boolean changed = insertBeforeIfs(orig, out, trapRange, anchor);
+            if (changed) injectHead(out, head);
+            return changed;
         }
 
-        // ---- 收集块出口：ASSIGN local = "key" 紧跟 GOTO loopHead ----
+        // ---- 收集块出口 ----
         List<Integer> exitPos = new ArrayList<>();
         List<String> allKeys = new ArrayList<>();
         for (int i = 0; i + 1 < orig.size(); i++) {
@@ -109,212 +119,182 @@ public class OpaquePredicatePass implements ObfuscationPass {
                 Value v = ((Stmt.E2Stmt) a).getOp2();
                 if (v.vt == Value.VT.CONSTANT && ((Constant) v).value instanceof String) {
                     allKeys.add((String) ((Constant) v).value);
-                    // 只保留位于 trap 区域之外的出口
-                    if (!trapRange.contains(i)) {
-                        exitPos.add(i);
-                    }
+                    if (!trapRange.contains(i)) exitPos.add(i);
                 }
             }
         }
         if (exitPos.size() < 2) {
-            return insertBeforeIfs(info, orig, out);
+            boolean changed = insertBeforeIfs(orig, out, trapRange, anchor);
+            if (changed) injectHead(out, head);
+            return changed;
         }
 
-        // ---- 种子：S1 与方法级常量 ----
-        Local seedCpu = newSimpleLocal(ir, "op_seed", "I");
-        // S2 用一个固定的非空字符串字面量，其 length() 恒 >= 1
-        String probe = buildProbeString();
-        Local seedLen = newSimpleLocal(ir, "op_len", "I");
-        // 注意：Exprs.nLength() 是数组取长度（arraylength），不能用于字符串。
-        // 字符串长度必须走 String.length() 虚调用。
-
-        // S3 用的乘数（!= 0）
-        int mul = 2 + random.nextInt(997);
-
         Set<Integer> handled = new HashSet<>(exitPos);
-        List<Stmt> body = new ArrayList<>(orig.size() * 2);
-
         for (int i = 0; i < orig.size(); i++) {
             if (!handled.contains(i)) {
-                body.add(orig.get(i));
+                out.add(orig.get(i));
                 continue;
             }
             Stmt.E2Stmt e2 = (Stmt.E2Stmt) orig.get(i);
             Local target = (Local) e2.getOp1();
             String realKey = (String) ((Constant) e2.getOp2()).value;
-
-            // 假目标：任一 key != realKey
             String fakeKey = null;
             for (String k : allKeys) {
                 if (!k.equals(realKey)) { fakeKey = k; break; }
             }
-            if (fakeKey == null) { body.add(orig.get(i)); continue; }
-
-            emitLayered(body, target, realKey, fakeKey, seedCpu, seedLen, mul);
+            if (fakeKey == null) { out.add(orig.get(i)); continue; }
+            emitLayered(out, target, realKey, fakeKey, anchor);
         }
-
-        // 入口初始化 seedCpu / seedLen
-        List<Stmt> head = new ArrayList<>(body.size() + 2);
-        head.add(Stmts.nAssign(seedCpu, availableProcessorsCall()));
-        head.add(Stmts.nAssign(seedLen, stringLengthCall(probe)));
-        head.addAll(body);
-        out.clear();
-        out.addAll(head);
-        ir.locals.add(seedCpu);
-        ir.locals.add(seedLen);
+        injectHead(out, head);
         return true;
     }
 
+    /** 把 anchor 初始化语句插到方法入口。 */
+    private void injectHead(List<Stmt> out, List<Stmt> head) {
+        if (head.isEmpty()) return;
+        List<Stmt> merged = new ArrayList<>(out.size() + head.size());
+        merged.addAll(head);
+        merged.addAll(out);
+        out.clear();
+        out.addAll(merged);
+    }
+
     /**
-     * 发射 N 层嵌套的恒真谓词。
+     * 发射 N 层数论恒真谓词。
      *
-     *   if (S1 > 0) {
-     *     if (S2 > 0) {
-     *       obfStr = realKey;
-     *     } else { obfStr = fakeKey; }
-     *   } else { obfStr = fakeKey; }
-     *
-     * 每层额外加一个假目标（S3 分支），让候选边数随层数指数增长。
+     *   if (P1) { if (P2) { ... { obfStr = realKey; }
+     *                       else { obfStr = fakeKey; } }
+     *             else { obfStr = fakeKey; } }
+     *   else    { obfStr = fakeKey; }
      */
     private void emitLayered(List<Stmt> out, Local target, String realKey, String fakeKey,
-                             Local seedCpu, Local seedLen, int mul) {
+                             Local x) {
         int n = layers;
-
-        // 为每层准备标签：层 i 的真分支进入层 i+1，假分支落到各自的假目标
-        List<LabelStmt> trueLabels = new ArrayList<>();
-        List<LabelStmt> falseLabels = new ArrayList<>();
+        List<LabelStmt> trueL = new ArrayList<>();
+        List<LabelStmt> falseL = new ArrayList<>();
         for (int i = 0; i < n; i++) {
-            trueLabels.add(newLabel());
-            falseLabels.add(newLabel());
+            trueL.add(newLabel());
+            falseL.add(newLabel());
         }
         LabelStmt join = newLabel();
-        LabelStmt realAssign = newLabel();
 
-        // ---- 逐层发射条件 ----
-        // 第 i 层的真分支落到 trueLabels[i]，紧接着就是第 i+1 层的判断；
-        // 最后一层的真分支才跳到 realAssign。
+        // 逐层发射条件。第 i 层的真分支落点 trueL[i] 就直接是
+        // 第 i+1 层的条件起点（最后一层则落到真实赋值处），
+        // 因此不需要额外的 realAssign 标签 —— 否则会多一条无用 GOTO。
         for (int i = 0; i < n; i++) {
             Value cond;
-            switch (i % 3) {
+            switch (i % COND_COUNT) {
                 case 0:
-                    // S1: availableProcessors() > 0
-                    cond = bin(VT.GT, seedCpu, i32(0), "I");
+                    // P1: (x * (x+1)) % 2 == 0
+                    cond = bin(VT.EQ,
+                            bin(VT.REM, bin(VT.MUL, x, bin(VT.ADD, x, i32(1), "I"), "I"),
+                                    i32(2), "I"),
+                            i32(0), "I");
                     break;
                 case 1:
-                    // S2: probe.length() > 0
-                    cond = bin(VT.GT, seedLen, i32(0), "I");
+                    // P2: (x | 1) != 0
+                    cond = bin(VT.NE, bin(VT.OR, x, i32(1), "I"), i32(0), "I");
                     break;
                 default:
-                    // S3: (seedCpu * mul) % mul == 0 —— 算术恒真
-                    cond = bin(VT.EQ,
-                            bin(VT.REM, bin(VT.MUL, seedCpu, i32(mul), "I"),
-                                    i32(mul), "I"),
+                    // P3: (x ^ (x >> 31)) >= 0
+                    cond = bin(VT.GE,
+                            bin(VT.XOR, x, bin(VT.SHR, x, i32(31), "I"), "I"),
                             i32(0), "I");
                     break;
             }
-            out.add(Stmts.nIf(cond, trueLabels.get(i)));
-            out.add(Stmts.nGoto(falseLabels.get(i)));
-            // 真分支落点：下一层的条件从这里开始
-            out.add(trueLabels.get(i));
+            out.add(Stmts.nIf(cond, trueL.get(i)));
+            out.add(Stmts.nGoto(falseL.get(i)));
+            out.add(trueL.get(i));
         }
-        // 全部为真 → 赋真实 key
-        out.add(realAssign);
         out.add(Stmts.nAssign(target, stringConst(realKey)));
         out.add(Stmts.nGoto(join));
 
-        // ---- 各层假分支：赋假 key ----
         for (int i = 0; i < n; i++) {
-            out.add(falseLabels.get(i));
+            out.add(falseL.get(i));
             out.add(Stmts.nAssign(target, stringConst(fakeKey)));
             out.add(Stmts.nGoto(join));
         }
-
         out.add(join);
     }
 
-    /** 没有平坦化结构时：在每个 IF 前插一条恒假分支。 */
-    private boolean insertBeforeIfs(IrMethodInfo info, List<Stmt> orig, List<Stmt> out) {
-        IrMethod ir = info.raw();
-        Local seed = newSimpleLocal(ir, "op_seed", "I");
-        Local len = newSimpleLocal(ir, "op_len", "I");
-        String probe = buildProbeString();
+    /** 没平坦化结构时：每个可插入的 IF 前加一条数论恒假分支。 */
+    private boolean insertBeforeIfs(List<Stmt> orig, List<Stmt> out,
+                                    Set<Integer> trapRange, Local anchor) {
         int n = 0;
-        Set<Integer> trapRange = trapCoveredIndices(info, orig);
         for (int idx = 0; idx < orig.size(); idx++) {
             Stmt st = orig.get(idx);
             if (st.st == Stmt.ST.IF && !trapRange.contains(idx) && random.nextBoolean()) {
                 LabelStmt skip = newLabel();
-                Value cond = (n % 2 == 0)
-                        ? bin(VT.LT, seed, i32(0), "I")       // 恒假
-                        : bin(VT.LT, len, i32(0), "I");       // 恒假
+                // 恒假：(x * (x+1)) % 2 != 0 —— 永假，所以永远跳过
+                Value cond = bin(VT.NE,
+                        bin(VT.REM, bin(VT.MUL, anchor,
+                                bin(VT.ADD, anchor, i32(1), "I"), "I"),
+                                i32(2), "I"),
+                        i32(0), "I");
                 out.add(Stmts.nIf(cond, skip));
                 out.add(skip);
                 n++;
             }
             out.add(st);
         }
-        if (n == 0) return false;
-        List<Stmt> head = new ArrayList<>(out.size() + 2);
-        head.add(Stmts.nAssign(seed, availableProcessorsCall()));
-        head.add(Stmts.nAssign(len, stringLengthCall(probe)));
-        head.addAll(out);
-        out.clear();
-        out.addAll(head);
-        ir.locals.add(seed);
-        ir.locals.add(len);
-        return true;
+        return n > 0;
     }
 
     /**
-     * 生成一个非空字面量，用于 length() >= 1 恒真判断。
-     * 用非 ASCII 字符避免被 dex2jar 的常量池优化合并成常见字符串。
+     * 选一个攻击者无法静态定值的 int anchor。
+     *
+     * 优先用方法已有的 int 局部变量（参数更佳：来自调用方，静态更不可知）。
+     * 一个都用不到时退回 availableProcessors() —— 那个弱，但好过没有。
      */
-    private String buildProbeString() {
-        StringBuilder sb = new StringBuilder();
-        int n = 3 + random.nextInt(5);
-        for (int i = 0; i < n; i++) {
-            sb.append((char) (0x4E00 + random.nextInt(0x5000)));
+    /**
+     * 选一个攻击者无法静态定值、且【进入循环前必然已初始化】的 int anchor。
+     *
+     * ⚠️ 只认参数，不认普通局部变量。
+     * 普通局部变量在 loop head 处可能尚未赋值 —— 平坦化把 loop head 变成
+     * 全部路径的汇合点，verifier 在该点做类型合并时，未初始化的 slot 会
+     * 退化为 UNINITIALIZED_VALUE：
+     *     dx: SimException: local 0043: invalid
+     *     d8: NegativeArraySizeException
+     * 参数由 JVM 保证入口已初始化，是唯一安全的选择。
+     *
+     * 没有 int 参数时，新造一个 slot 并在方法入口赋
+     * availableProcessors()（值 >= 1，恒真且静态不可折叠）。
+     */
+    private Local pickAnchor(IrMethod ir, List<Stmt> head) {
+        int slot = ir.isStatic ? 0 : 1;
+        if (ir.args != null) {
+            for (String argType : ir.args) {
+                if ("I".equals(argType)) {
+                    for (Local l : ir.locals) {
+                        if (l._ls_index == slot && "I".equals(l.valueType)) {
+                            return l;
+                        }
+                    }
+                }
+                slot += ("J".equals(argType) || "D".equals(argType)) ? 2 : 1;
+            }
         }
-        return sb.toString();
+        // 没有 int 参数：新造 slot 并在方法入口初始化
+        Local fresh = newLocal(ir, "op_anchor", "I");
+        head.add(Stmts.nAssign(fresh, Exprs.nInvokeVirtual(
+                new Value[]{Exprs.nInvokeStatic(new Value[]{}, "Ljava/lang/Runtime;",
+                        "getRuntime", new String[]{}, "Ljava/lang/Runtime;")},
+                "Ljava/lang/Runtime;", "availableProcessors", new String[]{}, "I")));
+        return fresh;
     }
 
-    /**
-     * 构造一个二元表达式并补上 valueType。
-     *
-     * ⚠️ BinopExpr 把类型存在 `type` 字段，而 IR2JConverter 读的是 `valueType`：
-     *     reBuildJumpInstructions -> v1.valueType.charAt(0)
-     * 只设 type 会让 valueType 为 null → 转换时 NPE。
-     * 两处都要设。
-     */
-    /**
-     * 算出被 trap 覆盖的语句下标集合。
-     *
-     * trap 的 [start, end) 区间内的指令不能插入新语句：
-     * handler 的栈帧是按原始指令序列生成的，插入会破坏
-     * 「进入 handler 时局部变量处于什么状态」这个假设，
-     * dx 报 local XXXX: invalid，d8 报 NegativeArraySizeException。
-     *
-     * 只覆盖 [start, end) 不够 —— handler 本身的位置也不能碰，
-     * 所以把 handlers 单独成一条语句的位置也排除。
-     */
     private Set<Integer> trapCoveredIndices(IrMethodInfo info, List<Stmt> orig) {
         Set<Integer> out = new HashSet<>();
         IrMethod ir = info.raw();
         if (ir.traps.isEmpty()) return out;
-
         Map<LabelStmt, Integer> labelIdx = new HashMap<>();
         for (int i = 0; i < orig.size(); i++) {
-            if (orig.get(i).st == Stmt.ST.LABEL) {
-                labelIdx.put((LabelStmt) orig.get(i), i);
-            }
+            if (orig.get(i).st == Stmt.ST.LABEL) labelIdx.put((LabelStmt) orig.get(i), i);
         }
         for (Trap t : ir.traps) {
-            Integer s = labelIdx.get(t.start);
-            Integer e = labelIdx.get(t.end);
+            Integer s = labelIdx.get(t.start), e = labelIdx.get(t.end);
             if (s != null && e != null) {
-                for (int i = s; i < e && i < orig.size(); i++) {
-                    out.add(i);
-                }
+                for (int i = s; i < e && i < orig.size(); i++) out.add(i);
             }
             if (t.handlers != null) {
                 for (LabelStmt h : t.handlers) {
@@ -326,14 +306,6 @@ public class OpaquePredicatePass implements ObfuscationPass {
         return out;
     }
 
-    /**
-     * 构造整型常量并补 valueType。
-     *
-     * ⚠️ IR2JConverter.reBuildE2Expression 第一行就是
-     *     String type = e2.op2.valueType;
-     * 然后 getOpcode(type, ...) 里 type.charAt(0)。
-     * i32() 创建的 Constant 不设 valueType → 直接 NPE。
-     */
     private static Constant i32(int v) {
         Constant c = Exprs.nInt(v);
         c.valueType = "I";
@@ -345,20 +317,22 @@ public class OpaquePredicatePass implements ObfuscationPass {
         switch (vt) {
             case GT:  e = Exprs.nGt(a, b, type); break;
             case LT:  e = Exprs.nLt(a, b, type); break;
+            case GE:  e = Exprs.nGe(a, b, type); break;
+            case LE:  e = Exprs.nLe(a, b, type); break;
             case EQ:  e = Exprs.nEq(a, b, type); break;
             case NE:  e = Exprs.nNe(a, b, type); break;
             case MUL: e = Exprs.nMul(a, b, type); break;
             case REM: e = Exprs.nRem(a, b, type); break;
+            case ADD: e = Exprs.nAdd(a, b, type); break;
+            case SUB: e = Exprs.nSub(a, b, type); break;
+            case OR:  e = Exprs.nOr(a, b, type); break;
+            case AND: e = Exprs.nAnd(a, b, type); break;
+            case XOR: e = Exprs.nXor(a, b, type); break;
+            case SHR: e = Exprs.nShr(a, b, type); break;
             default:  throw new IllegalArgumentException("unsupported: " + vt);
         }
         e.valueType = type;
         return e;
-    }
-
-    /** s.length()，返回值恒 >= 1（s 是字面量）。 */
-    private InvokeExpr stringLengthCall(String s) {
-        return Exprs.nInvokeVirtual(new Value[]{Exprs.nString(s)},
-                "Ljava/lang/String;", "length", new String[]{}, "I");
     }
 
     private Constant stringConst(String s) {
@@ -367,14 +341,8 @@ public class OpaquePredicatePass implements ObfuscationPass {
         return c;
     }
 
-    public static InvokeExpr availableProcessorsCall() {
-        return Exprs.nInvokeVirtual(
-                new Value[]{Exprs.nInvokeStatic(new Value[]{}, "Ljava/lang/Runtime;",
-                        "getRuntime", new String[]{}, "Ljava/lang/Runtime;")},
-                "Ljava/lang/Runtime;", "availableProcessors", new String[]{}, "I");
-    }
-
-    private Local newSimpleLocal(IrMethod ir, String name, String type) {
+    /** 新建 local 并立刻登记（否则连续两次调用会拿到同一槽位）。 */
+    private Local newLocal(IrMethod ir, String name, String type) {
         int next = 0;
         for (Local l : ir.locals) {
             if (l._ls_index < 0) continue;
@@ -383,6 +351,7 @@ public class OpaquePredicatePass implements ObfuscationPass {
         }
         Local local = Exprs.nLocal(next, name);
         local.valueType = type;
+        ir.locals.add(local);
         return local;
     }
 
