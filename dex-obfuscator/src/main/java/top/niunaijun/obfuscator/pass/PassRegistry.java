@@ -96,6 +96,7 @@ public class PassRegistry {
                 // 单个模块失败不能拖垮整个方法：回退到这一步之前的语句
                 System.err.println("[pass:" + pass.name() + "] " + ir.owner + "->"
                         + ir.name + " 失败，跳过: " + t);
+                if (System.getenv("OBF_DEBUG") != null) t.printStackTrace();
             }
         }
         if (any) {
