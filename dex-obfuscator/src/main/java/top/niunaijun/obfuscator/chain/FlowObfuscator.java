@@ -16,6 +16,11 @@ import java.util.*;
 
 public class FlowObfuscator extends BaseObfuscatorChain {
 
+	/** case 表副本数：mask 取值 0..COPIES-1。太大体积会爆，4 已有 4 倍空间。 */
+	private static final int COPIES = 4;
+	/** 副本间隔。取大值避免不同块的区间重叠。 */
+	private static final int SPACE = 0x4000000;
+
 	public FlowObfuscator(ObfuscatorConfiguration obfuscatorConfiguration) {
 		super(obfuscatorConfiguration);
 	}
@@ -82,6 +87,8 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 		//     ② 在方法入口（while 之前）给它们插一条初始化为 0/null 的赋值，
 		//        使每个槽位在所有路径上都已初始化，合并结果有定义。
 		//   参数槽位（THIS_REF / PARAMETER_REF）不动：JVM 保证入口已初始化。
+		Local obfMask = newLocal("obf_mask", "I");
+		Local obfSuffixMask = newLocal("obf_suffix_mask", "I");
 		Local obfIndexFinal = newLocal("obf_index_final", "I");
 		Local obfIndex = newLocal("obf_index", "I");
 		Local obfStrHash = newLocal("obf_hash", "I");
@@ -174,15 +181,40 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 		newStmts.add(whileBlock.getLabelStmt());
 
 		newStmts.add(Stmts.nAssign(obfStrHash, hashInvoke(obfStr)));
-		// 状态值保持纯粹：必须能确定地命中 dispatcher 的某个 case。
-		// 不透明性由独立的 OpaquePredicatePass 负责（它在本 Pass 之后运行），
-		// 那里才是攻击者要猜「哪条边是活的」的地方。
-		newStmts.add(Stmts.nAssign(obfIndex, Exprs.nXor(obfIndexFinal, obfStrHash, "I")));
+
+		// ⚠️ 状态值混入运行时 mask：这是让「case 值 → 块」静态不可算的关键。
+		//
+		//   入口：mask = (System.nanoTime() >>> 20) & (COPIES-1)   每方法一次
+		//   分发：state = (keyHash ^ obfIndexI) + mask * SPACE
+		//
+		// case 表里每个块出现 COPIES 份（key+0*SPACE .. key+(COPIES-1)*SPACE），
+		// 攻击者即使读到全部 case 值和全部 key，也无法确定运行时落在哪一份 ——
+		// mask 来自 nanoTime，静态分析算不出来。
+		//
+		// 之前所有「不透明谓词」方案都没解决这一点：那些谓词是恒真条件，
+		// 攻击者删掉即可，映射关系本身依然是静态可读的。这里改的是映射本身。
+		// 全部在 int 层做：long→int 的 cast 在 dex2jar 里容易踩类型坑，
+		// 这里直接 (int)nanoTime() 然后按位与，够用且稳。
+		CastExpr maskInt = Exprs.nCast(nanoTimeCall(), "J", "I");
+		maskInt.valueType = "I";
+		newStmts.add(Stmts.nAssign(obfMask,
+				typed(Exprs.nAnd(maskInt, typedI(COPIES - 1), "I"))));
+
+		// state = (obfIndexFinal ^ obfStrHash) + mask * SPACE
+		newStmts.add(Stmts.nAssign(obfIndex,
+				typed(Exprs.nAdd(
+						typed(Exprs.nXor(obfIndexFinal, obfStrHash, "I")),
+						typed(Exprs.nMul(obfMask, typedI(SPACE), "I")),
+						"I"))));
 
 		Map<Integer, LabelStmt> switchBlock = new LinkedHashMap<>();
 
+		// 每个块生成 COPIES 份 case，覆盖 mask 的所有取值
 		for (LBlock newBlock : newBlocks) {
-			switchBlock.put(newBlock.getKey().hashCode() ^ obfIndexI, newBlock.getLabelStmt());
+			int base = newBlock.getKey().hashCode() ^ obfIndexI;
+			for (int c = 0; c < COPIES; c++) {
+				switchBlock.put(base + c * SPACE, newBlock.getLabelStmt());
+			}
 		}
 		LookupSwitchStmt lookupSwitchStmt = Stmts.nLookupSwitch(obfIndex,
 				switchBlock.keySet().stream().mapToInt(integer -> integer).toArray(),
@@ -229,6 +261,29 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 			return "<init>".equals(expr.method.getName());
 		}
 		return false;
+	}
+
+	/**
+	 * System.nanoTime()。每次调用返回不同值，静态分析无法定值。
+	 * 用它派生 mask，使 case 值 → 块的映射依赖运行时状态。
+	 */
+	/** 给表达式补上 valueType（IR2JConverter 的 getOpcode 依赖它）。 */
+	private static Value typed(BinopExpr e) {
+		e.valueType = e.vt == Value.VT.USHR ? "J" : "I";
+		return e;
+	}
+
+	private static Constant typedI(int v) {
+		Constant c = Exprs.nInt(v);
+		c.valueType = "I";
+		return c;
+	}
+
+	private InvokeExpr nanoTimeCall() {
+		InvokeExpr e = Exprs.nInvokeStatic(new Value[]{}, "Ljava/lang/System;",
+				"nanoTime", new String[]{}, "J");
+		e.valueType = "J";
+		return e;
 	}
 
 	private InvokeExpr hashInvoke(Local strLocal) {

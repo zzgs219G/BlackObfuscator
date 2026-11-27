@@ -58,6 +58,10 @@ public class PassRegistry {
                 () -> methodPasses.add(new InstructionSubstitutionPass(depth)));
         addModule("opaque-predicate", on(only, "opaque-predicate"),
                 () -> methodPasses.add(new OpaquePredicatePass(opaqueLayers)));
+        // MBA 放在最后：它在最内层表达式上工作，前面所有 Pass 生成的
+        // 算术都能被它再混淆一遍。
+        addModule("mba", on(only, "mba"),
+                () -> methodPasses.add(new MbaSubstitutionPass(depth)));
     }
 
     /** only 为 null 表示全开；否则只开集合内的。 */
