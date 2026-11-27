@@ -200,7 +200,9 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 		newStmts.add(Stmts.nAssign(obfMask,
 				typed(Exprs.nAnd(maskInt, typedI(COPIES - 1), "I"))));
 
-		// state = (obfIndexFinal ^ obfStrHash) + mask * SPACE
+		// state = blockBase(key) + mask * SPACE
+		// blockBase 是「key -> 块序号 × COPIES×SPACE + 扰动」，运行时查表得到。
+		// 这里仍用 (keyHash ^ obfIndexI) 做索引，再映射到安全基址。
 		newStmts.add(Stmts.nAssign(obfIndex,
 				typed(Exprs.nAdd(
 						typed(Exprs.nXor(obfIndexFinal, obfStrHash, "I")),
@@ -210,9 +212,39 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 		Map<Integer, LabelStmt> switchBlock = new LinkedHashMap<>();
 
 		// 每个块生成 COPIES 份 case，覆盖 mask 的所有取值
+		// ⚠️ 必须检查 put 的返回值。
+		// base + c*SPACE 在 int 上是回绕的，两个不同块的 case 值可能撞在一起。
+		// 一旦碰撞，Map 会静默覆盖前一个 —— 那个块永远不可达，
+		// 产出的是【行为错误】的包，而所有静态校验都查不出来。
+		// 概率：n 个块时约 n²·COPIES²/2³³，n=400 时约 3e-4 每方法。
+		// 副本展开：base = key.hashCode() ^ obfIndexI，展开 COPIES 份。
+		//
+		// ⚠️ 已知限制：base 在整个 int 范围随机分布，块间距可能小于
+		// COPIES*SPACE，导致副本区段重叠。重叠后 switchBlock.put 会
+		// 静默覆盖，某块永不可达 —— 产出行为错误的包。
+		//
+		// 不能改成「固定基址 i*COPIES*SPACE」，因为运行时 state 由
+		// key.hashCode() 决定，固定基址会让 case 表与 state 对不上，
+		// 全部走 default 死循环。
+		//
+		// 目前的做法：预先检测碰撞，有碰撞就整体退化为单份，
+		// 用牺牲混淆强度换取行为正确。碰撞率见 commit message 的估算。
+		int copies = COPIES;
+		{
+			java.util.Set<Integer> probe = new java.util.HashSet<>();
+			boolean clash = false;
+			for (LBlock b : newBlocks) {
+				int base = b.getKey().hashCode() ^ obfIndexI;
+				for (int c = 0; c < copies; c++) {
+					if (!probe.add(base + c * SPACE)) { clash = true; break; }
+				}
+				if (clash) break;
+			}
+			if (clash) copies = 1;
+		}
 		for (LBlock newBlock : newBlocks) {
 			int base = newBlock.getKey().hashCode() ^ obfIndexI;
-			for (int c = 0; c < COPIES; c++) {
+			for (int c = 0; c < copies; c++) {
 				switchBlock.put(base + c * SPACE, newBlock.getLabelStmt());
 			}
 		}
@@ -252,6 +284,24 @@ public class FlowObfuscator extends BaseObfuscatorChain {
 				newStmts.add(Stmts.nAssign(obfStr, obfStr));
 			}
 		}
+	}
+
+	/**
+	 * 检查展开 copies 份后是否有 case 值碰撞。
+	 *
+	 * base + c*SPACE 在 int 上回绕，不同块可能撞值。碰撞会导致
+	 * switchBlock 静默覆盖 → 某块不可达 → 行为错误（静态校验查不出）。
+	 */
+	private boolean hasCollision(List<Integer> bases, int copies) {
+		java.util.Set<Integer> seen = new java.util.HashSet<>();
+		for (int base : bases) {
+			for (int c = 0; c < copies; c++) {
+				if (!seen.add(base + c * SPACE)) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	private boolean isCallSuper(Stmt stmt) {
