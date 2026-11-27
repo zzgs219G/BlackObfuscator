@@ -1,6 +1,7 @@
 package top.niunaijun.obfuscator.pass;
 
 import com.googlecode.dex2jar.ir.IrMethod;
+import com.googlecode.dex2jar.ir.Trap;
 import com.googlecode.dex2jar.ir.expr.*;
 import com.googlecode.dex2jar.ir.expr.Value.VT;
 import com.googlecode.dex2jar.ir.stmt.*;
@@ -62,8 +63,10 @@ public class OpaquePredicatePass implements ObfuscationPass {
 
     @Override
     public boolean accept(IrMethodInfo ir) {
-        if (ir.trapCount() > 0) return false;
         if ("<init>".equals(ir.name()) || "<clinit>".equals(ir.name())) return false;
+        // 含异常表的方法也处理，但只在 trap 区域【之外】插谓词
+        // （见 safeRange / isInTrap）。插在 trap 覆盖范围内会破坏
+        // handler 的栈帧假设，dx 会报 local XXXX: invalid。
         return true;
     }
 
@@ -75,6 +78,10 @@ public class OpaquePredicatePass implements ObfuscationPass {
         }
 
         IrMethod ir = info.raw();
+
+        // 含异常表时，先算出被 trap 覆盖的语句下标集合。
+        // 这些位置不能插任何东西 —— handler 的栈帧依赖原始指令序列。
+        Set<Integer> trapRange = trapCoveredIndices(info, orig);
 
         // ---- 找 loop head：被 goto 指向最多的 label ----
         Map<LabelStmt, Integer> gotoCount = new HashMap<>();
@@ -102,7 +109,10 @@ public class OpaquePredicatePass implements ObfuscationPass {
                 Value v = ((Stmt.E2Stmt) a).getOp2();
                 if (v.vt == Value.VT.CONSTANT && ((Constant) v).value instanceof String) {
                     allKeys.add((String) ((Constant) v).value);
-                    exitPos.add(i);
+                    // 只保留位于 trap 区域之外的出口
+                    if (!trapRange.contains(i)) {
+                        exitPos.add(i);
+                    }
                 }
             }
         }
@@ -229,8 +239,10 @@ public class OpaquePredicatePass implements ObfuscationPass {
         Local len = newSimpleLocal(ir, "op_len", "I");
         String probe = buildProbeString();
         int n = 0;
-        for (Stmt st : orig) {
-            if (st.st == Stmt.ST.IF && random.nextBoolean()) {
+        Set<Integer> trapRange = trapCoveredIndices(info, orig);
+        for (int idx = 0; idx < orig.size(); idx++) {
+            Stmt st = orig.get(idx);
+            if (st.st == Stmt.ST.IF && !trapRange.contains(idx) && random.nextBoolean()) {
                 LabelStmt skip = newLabel();
                 Value cond = (n % 2 == 0)
                         ? bin(VT.LT, seed, i32(0), "I")       // 恒假
@@ -274,6 +286,46 @@ public class OpaquePredicatePass implements ObfuscationPass {
      * 只设 type 会让 valueType 为 null → 转换时 NPE。
      * 两处都要设。
      */
+    /**
+     * 算出被 trap 覆盖的语句下标集合。
+     *
+     * trap 的 [start, end) 区间内的指令不能插入新语句：
+     * handler 的栈帧是按原始指令序列生成的，插入会破坏
+     * 「进入 handler 时局部变量处于什么状态」这个假设，
+     * dx 报 local XXXX: invalid，d8 报 NegativeArraySizeException。
+     *
+     * 只覆盖 [start, end) 不够 —— handler 本身的位置也不能碰，
+     * 所以把 handlers 单独成一条语句的位置也排除。
+     */
+    private Set<Integer> trapCoveredIndices(IrMethodInfo info, List<Stmt> orig) {
+        Set<Integer> out = new HashSet<>();
+        IrMethod ir = info.raw();
+        if (ir.traps.isEmpty()) return out;
+
+        Map<LabelStmt, Integer> labelIdx = new HashMap<>();
+        for (int i = 0; i < orig.size(); i++) {
+            if (orig.get(i).st == Stmt.ST.LABEL) {
+                labelIdx.put((LabelStmt) orig.get(i), i);
+            }
+        }
+        for (Trap t : ir.traps) {
+            Integer s = labelIdx.get(t.start);
+            Integer e = labelIdx.get(t.end);
+            if (s != null && e != null) {
+                for (int i = s; i < e && i < orig.size(); i++) {
+                    out.add(i);
+                }
+            }
+            if (t.handlers != null) {
+                for (LabelStmt h : t.handlers) {
+                    Integer hi = labelIdx.get(h);
+                    if (hi != null) out.add(hi);
+                }
+            }
+        }
+        return out;
+    }
+
     /**
      * 构造整型常量并补 valueType。
      *
